@@ -1,6 +1,6 @@
 # ytcui-dl
 
-A fast, native C++17 YouTube stream resolver and downloader. No Python, no yt-dlp subprocess, no JavaScript interpreter. Talks directly to YouTube's InnerTube API via libcurl.
+A fast, native C++17 YouTube stream resolver and downloader. No Python, no yt-dlp subprocess, no JavaScript interpreter. Talks directly to YouTube's InnerTube API via libcurl. Only youtube... Yeah, the things you gotta give up for speed. But eh.
 
 ---
 
