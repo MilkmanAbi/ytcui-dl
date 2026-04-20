@@ -1,6 +1,6 @@
 # ytcui-dl
 
-**Blazing-fast YouTube stream resolver.** Drop-in yt-dlp alternative targeting YouTube specifically.
+**Blazing-fast YouTube stream resolver.** Drop-in yt-dlp alternative targeting YouTube specifically. (Eh, its fucky, Im bad at coding, sheesh, dont judge. I coded this shit for like 7 hours, gave up on 20+ over solutions, begged claude, still couldnt fix it. somehow fixed it, idk, it just works.)
 
 ytcui-dl resolves YouTube video/audio stream URLs in **~100ms** (cached: **<0.01ms**) vs yt-dlp's typical 2-5 seconds. Built as a C++17 header-only library + CLI, designed for YouTube TUI apps, music players, and anything that needs instant stream resolution.
 
