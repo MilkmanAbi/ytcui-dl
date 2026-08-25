@@ -1,0 +1,12 @@
+# Build output
+ytcui-dl
+test/test_yj
+test/test_client
+test/test_select
+test/test_http
+test/test_live
+test/test_download
+*.dSYM/
+
+# OS cruft
+.DS_Store
