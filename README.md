@@ -83,6 +83,61 @@ ytcui-dl -s "query" --json
 Build dependencies: OpenSSL, zlib, pthreads. Optional at runtime: `mpv` for
 `--play`, `ffmpeg` for muxing downloaded video+audio.
 
+## Downloading, from the command line
+
+Downloads went from "hangs or 403s on anything longer than about a minute"
+to "full 4K in seconds" partway through this project's life — not a tuning
+change, an actual wrong-client bug (the client chain was resolving through
+one that needs a Proof-of-Origin token this project can't mint; see
+[Known constraints](#known-constraints) for the specifics and why it may
+need re-checking again someday). What's below is what it looks like now
+that it works.
+
+There are two ways to download, picked by which flag you reach for:
+
+**`-d` / `--download`** — this project's own engine (`Downloader::fetch`,
+`yt_download.h`): parallel connections, automatic resume, and it hands you
+back whatever format YouTube actually served (raw `.m4a`/`.opus`/`.webm`
+for audio-only, muxed into the container yt reports for video+audio via
+`ffmpeg` if it's on `$PATH`). Reach for this when you want a specific
+resolution/codec/itag, or you're downloading something big enough that
+resume actually matters.
+
+**`-x` / `--extract-audio`** and **`--remux`** — an opt-in second path
+(`StreamDownloader::fetch`, `yt_stream_dl.h`) for when you just want a
+finished, ordinary file and don't care about the mechanics: `-x` always
+produces a `.mp3` (transcoded, since YouTube never serves MP3 source);
+`--remux` (combine with `-d`) always produces a `.mp4` (remuxed with no
+re-encode when the source codec allows it, transcoded automatically the
+rare times it doesn't). Under the hood it still uses this project's own
+fetch engine to actually pull the bytes — handing the raw URL straight to
+`ffmpeg` and letting it fetch measures out to roughly realtime speed on this
+CDN, not full bandwidth, for reasons in the "Streaming through ffmpeg"
+section further down — so `ffmpeg` only ever touches a local temp file, not
+the network.
+
+```sh
+# -d: this project's own engine, keeps the source format(s)
+ytcui-dl -d <url>                          # best video+audio, muxed via ffmpeg
+ytcui-dl -a -d <url>                       # audio only, raw (.m4a/.opus/...)
+ytcui-dl -V -d -q 1080 <url>               # video only, capped at 1080p
+ytcui-dl -d -q 1080 --vcodec avc1 <url>    # 1080p, H.264 specifically
+ytcui-dl -d --itag 251 <url>               # one exact format, no selection logic
+ytcui-dl -d -c 1 <url>                     # single connection (default is 3)
+ytcui-dl -d -o track.m4a <url>             # explicit output path
+ytcui-dl -d <url>                          # re-run on a partial file: resumes
+
+# -x / --remux: ffmpeg finishes the job, one file, no raw leftovers
+ytcui-dl -x <url>                          # audio -> .mp3
+ytcui-dl -d --remux <url>                  # video+audio -> .mp4
+ytcui-dl -V -d --remux -q 720 <url>        # video only -> .mp4, capped at 720p
+```
+
+Quality flags (`-q`/`--quality`, `--max-height`, `--vcodec`, `--acodec`,
+`--container`, `--hdr`, `--stereo`, `--itag`, ...) work identically for both
+paths — they decide *what* gets fetched; `-d` vs `-x`/`--remux` only decides
+*what happens to it afterward*. Full flag list: `ytcui-dl --help`.
+
 ## Three modes
 
 ```cpp
