@@ -1,8 +1,8 @@
 # ytcui-dl
 
-> AI Disclosure - ytcui-dl v1 was written by hand. ytcui-dl v2 is a full refactor I've been struggling to get working for MONTHS (I was doing most of it with my friend :3), Claude was used to test it - test whether it connects, the downloader works (The shitty ffmpeg based conversion to mp4 handler was written by me, still messed up, pardon me), and push the updated project to my repo once done. I acknowledge the use of AI in debugging and automating testing. (Yeah... long project full of fuck ups, v1 was in May, v2 is Aug end, took me that long to figure it out, architecture is mine, worked with claude to fix the issues that took me months to figure out)
+> **AI Disclosure:** ytcui-dl v1 was written entirely by hand. v2 is a full refactor developed over several months, with help from a friend. AI was used for debugging, testing functionality, and automating the final push to the repository. The project architecture and implementation are my own, while AI assisted with resolving issues during development.
 
-> Notes: I kinda focused so hard on improving ytcui-dl over like looking at it... Uhm missed some GitHub issues, will check them more nowadays.
+> PO-Token generator (JS-Challenge AND browser cookies methods BOTH) coming soon, sorting out some kinks.
 
 A small, header-only YouTube client in C++17. Resolves streams, plays them,
 downloads them. No libcurl, no JSON library, no yt-dlp.
