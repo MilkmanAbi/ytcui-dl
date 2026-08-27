@@ -2,7 +2,12 @@
 
 > **AI Disclosure:** ytcui-dl v1 was written entirely by hand. v2 is a full refactor developed over several months, with help from a friend. AI was used for debugging, testing functionality, and automating the final push to the repository. The project architecture and implementation are my own, while AI assisted with resolving issues during development.
 
-> PO-Token generator (JS-Challenge AND browser cookies methods BOTH) coming soon, sorting out some kinks.
+> PO-Token support has landed: `--pot-provider` delegates to a locally-run
+> [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+> for the JS-challenge method (the same one yt-dlp itself defers to -- nothing
+> mints a token without running Google's JS, yt-dlp's own core included), and
+> `--cookies` adds real logged-in-session authentication. Details in
+> [Known constraints](#known-constraints).
 
 A small, header-only YouTube client in C++17. Resolves streams, plays them,
 downloads them. No libcurl, no JSON library, no yt-dlp.
