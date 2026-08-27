@@ -8,6 +8,7 @@
 > mints a token without running Google's JS, yt-dlp's own core included), and
 > `--cookies` adds real logged-in-session authentication. Details in
 > [Known constraints](#known-constraints).
+> Not sure if PO is properly working, attempted by me and my friend, Claude fixed it up - not too sure if it's functional yet.
 
 A small, header-only YouTube client in C++17. Resolves streams, plays them,
 downloads them. No libcurl, no JSON library, no yt-dlp.
