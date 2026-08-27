@@ -5,12 +5,14 @@
  * InnerTube client. No JSON DOM anywhere: requests are built by appending to
  * a string, responses are scanned in place by yj.
  *
- * Client chain (probed live, July 2026):
- *   ANDROID     id 3   full adaptive set, 5.1 audio, no PO token needed
- *   ANDROID_VR  id 28  same set minus a few, useful when ANDROID is throttled
- *   IOS         id 5   no 5.1 audio, so ranked last for audio
+ * Client chain (see PLAYER_CHAIN below, current as of August 2026):
+ *   VISIONOS    id 101 leads: exempt from the GVS PO Token requirement today
+ *   ANDROID_VR  id 28  full adaptive set, useful when VISIONOS is throttled
+ *   ANDROID     id 3   full adaptive set, 5.1 audio
+ *   IOS         id 5   no 5.1 audio, so ranked last
  * WEB/MWEB/TVHTML5/embedded all return UNPLAYABLE for the player endpoint and
- * are not worth trying.
+ * are not worth trying for formats -- WEB is still used for visitorData
+ * bootstrap and search, where it works fine.
  *
  * Every request carries X-Goog-FieldMask. On the player endpoint that cuts the
  * response from ~183 KB to ~69 KB with an identical format list, because
@@ -18,17 +20,21 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include <openssl/evp.h>
 
 #include "yj.h"
 #include "yt_cache.h"
@@ -293,9 +299,11 @@ public:
         append_context(body, WEB_CLIENT, "");
         body += "}";
         try {
+            auto hdrs = headers_for(WEB_CLIENT, "responseContext.visitorData");
+            auto extra = auth_headers_locked();  // vd_mu_ already held here
+            hdrs.insert(hdrs.end(), extra.begin(), extra.end());
             auto r = get_thread_http().post(
-                std::string(INNERTUBE_BASE) + "guide?prettyPrint=false", body,
-                headers_for(WEB_CLIENT, "responseContext.visitorData"));
+                std::string(INNERTUBE_BASE) + "guide?prettyPrint=false", body, hdrs);
             if (r.status == 200) {
                 yj::Val vd = yj::path(yj::parse(r.body), "responseContext", "visitorData");
                 if (vd.is_str()) {
@@ -313,10 +321,14 @@ public:
         return visitor_;
     }
 
-    // Optional Proof-of-Origin token. We cannot mint one -- it comes from
-    // BotGuard/DroidGuard attestation -- but if the caller has a provider they
-    // can supply it and unlock the clients that require it for GVS. Leaving it
-    // unset is fine: the default chain leads with ANDROID_VR, which needs none.
+    // Optional Proof-of-Origin token. We cannot mint one ourselves -- it's a
+    // BotGuard JS attestation, and yt-dlp doesn't mint one in-house either
+    // (its core repo ships zero token-minting logic; every real provider is
+    // an external plugin). Leaving it unset is fine today: the chain leads
+    // with VISIONOS, which the current GVS PO Token policy doesn't require.
+    // If that gap closes, supply one via set_po_token() (pasted from
+    // somewhere that can solve the challenge) or fetch_po_token_from_provider()
+    // below (delegates to a local provider, the way yt-dlp itself does).
     // Disable the on-disk visitorData cache (embedded targets with no writable
     // filesystem, or callers that want a guaranteed-fresh token).
     void set_disk_cache(bool on) {
@@ -331,6 +343,91 @@ public:
     std::string po_token() {
         std::lock_guard<std::mutex> lk(vd_mu_);
         return po_token_;
+    }
+
+    // Loads a Netscape-format cookies.txt (the convention curl, yt-dlp, and
+    // every "export cookies" browser extension already use). Cookies whose
+    // domain is youtube.com or google.com are sent as a Cookie header on
+    // every InnerTube request from here on; if a SAPISID (or
+    // __Secure-3PAPISID) cookie is present, requests are additionally signed
+    // with a SAPISIDHASH Authorization header, the same origin-bound hash a
+    // real logged-in browser sends. This is real, working authentication --
+    // it unlocks age-gated/members-only/private videos and a logged-in
+    // WEB session -- but it is *not* a PO token: cookies alone don't produce
+    // one (see fetch_po_token_from_provider). Returns false if the file
+    // couldn't be read or had no youtube/google cookies in it.
+    bool set_cookies_file(const std::string& path) {
+        std::ifstream f(path);
+        if (!f) return false;
+        std::string cookies, sapisid, line;
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::string_view sv(line);
+            if (sv.rfind("#HttpOnly_", 0) == 0) sv.remove_prefix(10);
+            else if (sv[0] == '#') continue;
+            std::vector<std::string_view> field;
+            field.reserve(7);
+            size_t start = 0;
+            for (size_t i = 0; i <= sv.size(); ++i) {
+                if (i == sv.size() || sv[i] == '\t') {
+                    field.push_back(sv.substr(start, i - start));
+                    start = i + 1;
+                }
+            }
+            if (field.size() < 7) continue;
+            std::string_view domain = field[0], name = field[5], value = field[6];
+            if (domain.find("youtube.com") == std::string_view::npos &&
+                domain.find("google.com") == std::string_view::npos) continue;
+            if (!cookies.empty()) cookies += "; ";
+            cookies.append(name); cookies += '='; cookies.append(value);
+            if (name == "SAPISID" || name == "__Secure-3PAPISID")
+                sapisid = std::string(value);
+        }
+        if (cookies.empty()) return false;
+        std::lock_guard<std::mutex> lk(vd_mu_);
+        cookie_header_ = std::move(cookies);
+        sapisid_ = std::move(sapisid);
+        return true;
+    }
+
+    // Queries an external PO-Token provider over HTTP for a token bound to
+    // our visitorData -- the exact request yt-dlp's own bgutil plugin makes
+    // to https://github.com/Brainicism/bgutil-ytdlp-pot-provider running
+    // locally (`docker run ... brainicism/bgutil-ytdlp-pot-provider`, or
+    // `node build/main.js`). We don't solve the BotGuard challenge ourselves
+    // -- nothing does without executing Google's JS, yt-dlp included -- this
+    // just talks to something that already can. Returns false (and leaves
+    // playback to proceed without a token) if the provider isn't reachable.
+    bool fetch_po_token_from_provider(const std::string& base_url = "http://127.0.0.1:4416") {
+        ensure_visitor_data();
+        std::string vd = get_vd();
+        if (vd.empty()) return false;
+        std::string body = "{\"content_binding\":\"";
+        json_escape_to(vd, body);
+        body += "\"}";
+        try {
+            HttpClient h;
+            h.set_timeouts(3000, 8000);
+            auto r = h.post(base_url + "/get_pot", body, {"Content-Type: application/json"});
+            if (r.status != 200) return false;
+            yj::Val tok = yj::path(yj::parse(r.body), "poToken");
+            if (!tok.is_str()) return false;
+            std::string t(yj::unescape(tok.raw()));
+
+            // The player endpoint decodes this field as raw protobuf bytes:
+            // confirmed live that a string that doesn't survive base64
+            // decoding doesn't just get ignored, it 400s the *entire* player
+            // request -- every client in the chain, not just this one. A real
+            // token (base64url, well over 100 chars) is nowhere near this
+            // boundary; this only exists to keep a broken or misconfigured
+            // provider from silently taking down every client at once.
+            const bool plausible = t.size() >= 40 && std::all_of(t.begin(), t.end(),
+                [](unsigned char ch) { return std::isalnum(ch) || ch == '-' || ch == '_' || ch == '='; });
+            if (!plausible) return false;
+
+            set_po_token(std::move(t));
+            return true;
+        } catch (...) { return false; }
     }
 
     // -----------------------------------------------------------------------
@@ -352,9 +449,11 @@ public:
         std::vector<SearchResult> out;
         HttpClient::Response r;
         try {
+            auto hdrs = headers_for(ANDROID_CLIENT, SEARCH_MASK);
+            auto extra = auth_headers();
+            hdrs.insert(hdrs.end(), extra.begin(), extra.end());
             r = get_thread_http().post(
-                std::string(INNERTUBE_BASE) + "search?prettyPrint=false", body,
-                headers_for(ANDROID_CLIENT, SEARCH_MASK));
+                std::string(INNERTUBE_BASE) + "search?prettyPrint=false", body, hdrs);
         } catch (...) { return out; }
         if (r.status != 200) return out;
 
@@ -790,9 +889,51 @@ private:
     std::mutex        vd_mu_;
     std::string       visitor_;
     std::string       po_token_;
+    std::string       cookie_header_;
+    std::string       sapisid_;
     int64_t           vd_t_ = 0;
     bool              use_disk_cache_ = true;
     static constexpr const char* kVisitorKey = "visitor_data";
+
+    static std::string sha1_hex(const std::string& s) {
+        unsigned char digest[EVP_MAX_MD_SIZE];
+        unsigned int len = 0;
+        EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+        EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+        EVP_DigestUpdate(ctx, s.data(), s.size());
+        EVP_DigestFinal_ex(ctx, digest, &len);
+        EVP_MD_CTX_free(ctx);
+        static const char* hexch = "0123456789abcdef";
+        std::string out;
+        out.reserve(len * 2);
+        for (unsigned int i = 0; i < len; ++i) {
+            out.push_back(hexch[digest[i] >> 4]);
+            out.push_back(hexch[digest[i] & 0xF]);
+        }
+        return out;
+    }
+
+    // Cookie/SAPISIDHASH headers to merge onto every InnerTube request, once
+    // set_cookies_file() has loaded something. Empty when no cookies are
+    // loaded, so every call site can unconditionally append this vector.
+    // Caller must already hold vd_mu_.
+    std::vector<std::string> auth_headers_locked() {
+        std::vector<std::string> h;
+        if (cookie_header_.empty()) return h;
+        h.emplace_back("Cookie: " + cookie_header_);
+        if (!sapisid_.empty()) {
+            const int64_t ts = now_s();
+            static constexpr const char* kOrigin = "https://www.youtube.com";
+            const std::string hash = sha1_hex(std::to_string(ts) + " " + sapisid_ + " " + kOrigin);
+            h.emplace_back("Authorization: SAPISIDHASH " + std::to_string(ts) + "_" + hash);
+            h.emplace_back(std::string("X-Origin: ") + kOrigin);
+        }
+        return h;
+    }
+    std::vector<std::string> auth_headers() {
+        std::lock_guard<std::mutex> lk(vd_mu_);
+        return auth_headers_locked();
+    }
 
     void ensure_visitor_data() {
         { std::lock_guard<std::mutex> lk(vd_mu_);
@@ -880,15 +1021,27 @@ private:
         }
         body += "}";
 
+        auto hdrs = headers_for(c, PLAYER_MASK);
+        auto extra = auth_headers();
+        hdrs.insert(hdrs.end(), extra.begin(), extra.end());
         auto r = get_thread_http().post(
-            std::string(INNERTUBE_BASE) + "player?prettyPrint=false", body,
-            headers_for(c, PLAYER_MASK));
+            std::string(INNERTUBE_BASE) + "player?prettyPrint=false", body, hdrs);
         if (r.status != 200) return {};
 
         VideoInfo info;
         parse_player_into(r.body, vid, info);
         info.client_name = c.name;
         info.client_ua   = c.ua;
+
+        // Player-context PO tokens (above, in serviceIntegrityDimensions) can
+        // unlock the format *list*; the GVS-context token that authorizes
+        // actually fetching the bytes is a URL query param on each format's
+        // own URL, appended here so every caller downstream -- download,
+        // --play, --get-url -- gets it for free.
+        if (std::string pot = po_token(); !pot.empty()) {
+            const std::string suffix = "&pot=" + HttpClient::url_encode(pot);
+            for (auto& f : info.formats) if (!f.url.empty()) f.url += suffix;
+        }
         return info;
     }
 

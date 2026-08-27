@@ -475,9 +475,34 @@ search 317 KB   4469 us / 22363 allocs / 1157 KB -> 1333 us / 60 allocs / 8.4 KB
 - **A version pin is load-bearing.** `ANDROID` is pinned to 20.10.38; newer
   versions get SABR. The tradeoff is that it returns `LOGIN_REQUIRED` without
   `visitorData`, so the bootstrap is not optional.
-- **PO Tokens are not minted.** They come from BotGuard/DroidGuard attestation
-  and cannot be produced by a plain client. `set_po_token()` (`--po-token` on
-  the CLI) accepts one from an external provider.
+- **PO Tokens are not minted, on purpose -- nothing does this without running
+  Google's JS.** A PO Token is a BotGuard attestation; producing one requires
+  actually executing Google's obfuscated challenge JS somewhere, and that's
+  true of yt-dlp too -- its own core repo ships zero token-minting logic, only
+  a plugin interface, confirmed by reading it. Three ways to get one into
+  ytcui-dl, in the order they matter:
+  - **`--po-token <tok>`** -- paste one you already have (a browser extension,
+    a manual mint, whatever). Used as-is.
+  - **`--pot-provider`** (or `--pot-provider-url <url>` for a non-default
+    address) -- fetches one automatically from a locally-running
+    [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider),
+    the same external Node/Deno service yt-dlp's own `bgutil` plugin talks to
+    (`POST /get_pot {content_binding}` -> `{poToken}`). This project doesn't
+    solve the BotGuard challenge any more than yt-dlp's core does; it just
+    speaks that provider's HTTP API. Run the provider yourself
+    (`docker run brainicism/bgutil-ytdlp-pot-provider` is the easy path) and
+    the flag does the rest. A response that doesn't decode as plausible
+    base64url is rejected rather than sent on -- confirmed live that YouTube's
+    player endpoint 400s the *entire* request (every client in the chain, not
+    just the field) on a malformed token, so a broken or misconfigured
+    provider degrades to "no token" instead of taking down playback.
+  - **`--cookies <file>`** -- a Netscape-format `cookies.txt` (curl/yt-dlp
+    convention). This is *not* a PO Token -- cookies alone don't produce one,
+    confirmed against yt-dlp's own architecture -- but a `SAPISID` cookie gets
+    turned into a real `SAPISIDHASH` `Authorization` header, the same
+    origin-bound signature a logged-in browser sends, which does unlock
+    age-gated/members-only/private videos and a logged-in `WEB` session for
+    search/bootstrap.
 - **`ANDROID_VR`/`ANDROID`/`IOS` now all require one for GVS media fetch, and
   the chain leads with `VISIONOS` (Apple Vision Pro) instead, which as of
   yt-dlp's current `INNERTUBE_CLIENTS` table still doesn't.** Those three still

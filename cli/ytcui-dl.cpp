@@ -11,6 +11,7 @@
 #include "ytdlp_compat.h"
 
 #include <cstdarg>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -223,6 +224,16 @@ static std::vector<std::string> mpv_args(const Selection& sel, Mode mode,
     return a;
 }
 
+// Set for the duration of spawn_mpv() so forward_to_mpv() can find the child.
+// sig_atomic_t, not a mutex: only ever touched from the main thread and from
+// inside a signal handler, so a lock would be both wrong (not async-signal-
+// safe) and unnecessary.
+static volatile sig_atomic_t g_mpv_pid = 0;
+
+static void forward_to_mpv(int sig) {
+    if (g_mpv_pid > 0) kill((pid_t)g_mpv_pid, sig);
+}
+
 static int spawn_mpv(const std::vector<std::string>& args) {
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
@@ -232,8 +243,24 @@ static int spawn_mpv(const std::vector<std::string>& args) {
     pid_t pid = fork();
     if (pid < 0) { std::fprintf(stderr, "fork failed\n"); return 1; }
     if (pid == 0) { execvp("mpv", argv.data()); _exit(127); }
+
+    // Without this, killing ytcui-dl (Ctrl-C, a signal from a wrapping TUI,
+    // etc.) orphans mpv: fork() gives it its own pid, so a signal to us never
+    // reaches it on its own, and it plays on indefinitely in the background.
+    g_mpv_pid = pid;
+    struct sigaction sa{}, old_int{}, old_term{};
+    sa.sa_handler = forward_to_mpv;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT,  &sa, &old_int);
+    sigaction(SIGTERM, &sa, &old_term);
+
     int st = 0;
     waitpid(pid, &st, 0);
+
+    sigaction(SIGINT,  &old_int,  nullptr);
+    sigaction(SIGTERM, &old_term, nullptr);
+    g_mpv_pid = 0;
+
     if (WIFEXITED(st) && WEXITSTATUS(st) == 127) {
         std::fprintf(stderr, "mpv not found in PATH\n");
         return 127;
@@ -500,9 +527,17 @@ static void usage() {
 "    -n, --max-results <n>     search result count (default 15)\n"
 "        --volume <n>          mpv volume for --play\n"
 "        --no-cache            skip the on-disk visitorData cache\n"
+"        --cookies <file>      Netscape-format cookies.txt; authenticates as\n"
+"                              that logged-in session (age-gated/members-\n"
+"                              only/private videos). Not a PO token.\n"
 "        --po-token <tok>      Proof-of-Origin token from an external\n"
 "                              provider; needed if media fetches 403 after\n"
 "                              an initial ~1 minute of a stream (see below)\n"
+"        --pot-provider        fetch a PO token automatically from a local\n"
+"                              provider at http://127.0.0.1:4416/get_pot\n"
+"                              (the bgutil-ytdlp-pot-provider HTTP API --\n"
+"                              run that separately; see README)\n"
+"        --pot-provider-url <url>  same, at a non-default provider address\n"
 "    -4, --ipv4                force IPv4 (fixes 403s on dual-stack networks)\n"
 "    -6, --ipv6                force IPv6\n"
 "        --quiet               suppress progress and status output\n"
@@ -771,7 +806,8 @@ int main(int argc, char** argv) {
     int  max_results = 15, connections = 3, volume = -1, want_itag = 0;
     bool json = false, no_resume = false, no_mux = false, no_cache = false;
     bool print_mpv = false, force_any_codec = false, via_ffmpeg = false;
-    std::string po_token;
+    std::string po_token, cookies_file, pot_provider_url;
+    bool use_pot_provider = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -825,6 +861,12 @@ int main(int argc, char** argv) {
         else if (a == "--no-mux")     no_mux = true;
         else if (a == "--no-cache")   no_cache = true;
         else if (a == "--po-token")   po_token = next("--po-token");
+        else if (a == "--cookies")    cookies_file = next("--cookies");
+        else if (a == "--pot-provider") use_pot_provider = true;
+        else if (a == "--pot-provider-url") {
+            use_pot_provider = true;
+            pot_provider_url = next("--pot-provider-url");
+        }
         else if (a == "-4" || a == "--ipv4") set_ip_family(IpFamily::V4);
         else if (a == "-6" || a == "--ipv6") set_ip_family(IpFamily::V6);
         else if (a == "-n" || a == "--max-results") max_results = std::atoi(next("--max-results").c_str());
@@ -840,7 +882,21 @@ int main(int argc, char** argv) {
     CurlGlobalInit init;
     auto& yt = InnertubeClient::get_instance();
     if (no_cache) yt.set_disk_cache(false);
-    if (!po_token.empty()) yt.set_po_token(po_token);
+    if (!cookies_file.empty() && !yt.set_cookies_file(cookies_file))
+        std::fprintf(stderr,
+            "warning: --cookies %s: couldn't read it, or no youtube/google "
+            "cookies in it\n", cookies_file.c_str());
+    if (!po_token.empty()) {
+        yt.set_po_token(po_token);
+    } else if (use_pot_provider) {
+        const std::string url = pot_provider_url.empty()
+            ? "http://127.0.0.1:4416" : pot_provider_url;
+        if (!yt.fetch_po_token_from_provider(url))
+            std::fprintf(stderr,
+                "warning: --pot-provider: couldn't reach %s -- is a PO-Token "
+                "provider (e.g. bgutil-ytdlp-pot-provider) running there? "
+                "continuing without one.\n", url.c_str());
+    }
 
     // The prefetch worker must be joined before static destructors run.
     struct Cleanup { InnertubeClient& c; ~Cleanup() { c.shutdown(); } } cleanup{yt};
