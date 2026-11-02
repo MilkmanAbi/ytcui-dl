@@ -74,21 +74,31 @@ CXXFLAGS += -fno-rtti
 
 BIN     := ytcui-dl
 SRC     := cli/ytcui-dl.cpp
+# ytcui-we is the browser session helper: it opens the user's own default
+# browser to sign in and exports the resulting cookies for --cookies. POSIX
+# only (fork/exec plus the platform secret stores), same as everything else.
+WE_BIN  := ytcui-we
+WE_SRC  := cli/ytcui-we.cpp
 HEADERS := $(wildcard include/*.h) $(wildcard cli/*.h)
 
 .PHONY: all clean install uninstall test test-live diag size
 
-all: $(BIN)
+all: $(BIN) $(WE_BIN)
 
 $(BIN): $(SRC) $(HEADERS)
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDFLAGS)
 	@strip $@ 2>/dev/null || true
 
+$(WE_BIN): $(WE_SRC) $(HEADERS)
+	$(CXX) $(CXXFLAGS) -o $@ $(WE_SRC) $(LDFLAGS)
+	@strip $@ 2>/dev/null || true
+
 # Offline: parser, extraction, itag table, selection engine. No network.
-test: test/test_yj test/test_client test/test_select
+test: test/test_yj test/test_client test/test_select test/test_sqlite
 	./test/test_yj test/fixtures
 	./test/test_client test/fixtures
 	./test/test_select test/fixtures
+	./test/test_sqlite
 
 # Network: TLS, gzip, redirects, live InnerTube, download engine.
 test-live: test/test_http test/test_live test/test_download
@@ -103,17 +113,19 @@ diag: $(BIN)
 test/test_%: test/test_%.cpp $(HEADERS)
 	$(CXX) -std=c++17 -O2 -Wno-deprecated-declarations -Iinclude $(filter -I%,$(CXXFLAGS)) -o $@ $< $(LDFLAGS)
 
-size: $(BIN)
+size: $(BIN) $(WE_BIN)
+	@echo "ytcui-we: $$(stat -c%s $(WE_BIN) 2>/dev/null || stat -f%z $(WE_BIN)) bytes"
 	@echo "binary:  $$(stat -c%s $(BIN) 2>/dev/null || stat -f%z $(BIN)) bytes"
 	@echo "deps:    $$(ldd $(BIN) 2>/dev/null | wc -l) shared objects"
 	@size $(BIN) 2>/dev/null || true
 
-install: $(BIN)
+install: $(BIN) $(WE_BIN)
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(BIN) $(DESTDIR)$(BINDIR)/$(BIN)
+	install -m 755 $(WE_BIN) $(DESTDIR)$(BINDIR)/$(WE_BIN)
 
 uninstall:
-	rm -f $(DESTDIR)$(BINDIR)/$(BIN)
+	rm -f $(DESTDIR)$(BINDIR)/$(BIN) $(DESTDIR)$(BINDIR)/$(WE_BIN)
 
 clean:
-	rm -f $(BIN) test/test_yj test/test_client test/test_select test/test_http test/test_live test/test_download
+	rm -f $(BIN) $(WE_BIN) test/test_yj test/test_client test/test_select test/test_http test/test_live test/test_download test/test_sqlite

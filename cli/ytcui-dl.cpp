@@ -43,21 +43,8 @@ static void info_msg(const char* fmt, ...) {
 
 static std::string sv2s(std::string_view v) { return std::string(v); }
 
-// Accepts a bare id, a watch URL, youtu.be, shorts, embed, or a live URL.
-static std::string extract_id(const std::string& s) {
-    if (s.size() == 11 && s.find('/') == std::string::npos &&
-        s.find('.') == std::string::npos) return s;
-    static const char* keys[] = {"v=", "/shorts/", "/embed/", "/live/", "youtu.be/"};
-    for (const char* k : keys) {
-        size_t p = s.find(k);
-        if (p == std::string::npos) continue;
-        p += std::strlen(k);
-        size_t e = s.find_first_of("&?/#", p);
-        std::string id = s.substr(p, e == std::string::npos ? std::string::npos : e - p);
-        if (id.size() >= 11) return id.substr(0, 11);
-    }
-    return s;
-}
+// Shared with ytcui-we; the implementation is in yt_types.h.
+static std::string extract_id(const std::string& s) { return extract_video_id(s); }
 
 // A format's signed URL only works with the exact User-Agent of the client
 // that signed it. VideoInfo::client_ua carries that from whichever client in
@@ -158,6 +145,8 @@ static void emit_info(yjw::Writer& w, const VideoInfo& info, const Selection* se
     w.kv("duration_string", info.duration_str);
     w.kv("view_count", info.view_count);
     w.kv("is_live", info.is_live);
+    w.kv("is_live_now", info.is_live_now);
+    w.kv("hls_manifest_url", info.hls_url);
     w.kv("thumbnail", info.thumbnail_url);
     w.kv("webpage_url", info.url);
     w.kv("sabr_only", info.sabr_only);
@@ -222,6 +211,61 @@ static std::vector<std::string> mpv_args(const Selection& sel, Mode mode,
     // stream is muxed and already carries its own audio.
     if (sel.audio && !sel.muxed) a.push_back("--audio-file=" + sel.audio->url);
     return a;
+}
+
+// An HLS manifest is a single URL that already carries every track, so none
+// of the video+audio pairing mpv_args() does above applies -- mpv picks a
+// variant out of the manifest itself. A separate function rather than a flag
+// on that one, because there is no Selection behind this and nothing to pair.
+static std::vector<std::string> mpv_args_hls(const std::string& url, Mode mode,
+                                             const std::string& title, int volume,
+                                             const char* ua) {
+    std::vector<std::string> a = {"mpv", "--ytdl=no",
+                                  std::string("--user-agent=") + ua};
+    if (volume >= 0)    a.push_back("--volume=" + std::to_string(volume));
+    if (!title.empty()) a.push_back("--force-media-title=" + title);
+    if      (mode == Mode::AudioOnly) a.push_back("--no-video");
+    else if (mode == Mode::VideoOnly) a.push_back("--no-audio");
+    else                              a.push_back("--force-window=yes");
+    a.push_back(url);
+    return a;
+}
+
+// Which transport --play should use when both are available.
+enum class HlsPref { Auto, Force, Never };
+
+// Clients whose signed GVS URLs the CDN stops serving after roughly a minute
+// of stream, scaled by the format's bitrate (see "Known constraints" in the
+// README). VISIONOS is the only client in the chain without that cap, so
+// reaching one of these at all means VISIONOS declined the video -- a "made
+// for kids" upload, most often. Confirmed by tail probe rather than assumed:
+// ANDROID and ANDROID_VR both 403 the end of a stream whose own player
+// response describes it perfectly.
+static bool client_is_byte_capped(const VideoInfo& info) {
+    const char* n = info.client_name;
+    if (!n) return false;
+    return std::strcmp(n, "ANDROID")    == 0 ||
+           std::strcmp(n, "ANDROID_VR") == 0 ||
+           std::strcmp(n, "IOS")        == 0;
+}
+
+// Capped *and* long enough for the cap to actually bite. Anything that fits
+// inside the first minute plays fine from any of them, so there is nothing to
+// warn about and nothing worth routing around.
+static bool capped_and_long(const VideoInfo& info) {
+    return client_is_byte_capped(info) && info.duration_secs > 75;
+}
+
+static void warn_capped(const VideoInfo& info) {
+    const char* n = info.client_name ? info.client_name : "?";
+    std::fprintf(stderr,
+        "warning: resolved via %s, whose media URLs the CDN stops serving after\n"
+        "         roughly a minute of stream -- expect this to stop early.\n"
+        "         No tokenless client serves this video in full: VISIONOS, the\n"
+        "         one without that cap, declined it (typically a 'made for kids'\n"
+        "         upload). It would need a GVS PO Token for %s, and a browser-\n"
+        "         minted one will not do: web tokens are not valid on Android or\n"
+        "         iOS clients. See 'Known constraints' in the README.\n", n, n);
 }
 
 // Set for the duration of spawn_mpv() so forward_to_mpv() can find the child.
@@ -361,8 +405,35 @@ static int run_diag(const std::string& test_id) {
     if (!vd.empty()) ok("visitorData", std::to_string(vd.size()) + " chars");
     else             bad("visitorData", "empty — player requests will be rejected");
 
+    // A client can hand back a complete, URL-carrying format list and still
+    // have the CDN refuse everything past roughly a minute of the stream --
+    // ANDROID_VR has behaved exactly that way since 2026-08-17. Printing such
+    // a client as [ ok ] is precisely the silent failure this tool exists to
+    // surface, so each one now gets a real fetch near the end of its own audio
+    // URL. Returns 1 served, 0 refused, -1 nothing worth probing.
+    auto tail_probe = [](const VideoInfo& v) -> int {
+        const StreamFormat* a = nullptr;
+        for (const auto& f : v.formats)
+            if (f.is_audio_only() && !f.url.empty() &&
+                f.content_length > 1024 * 1024) { a = &f; break; }
+        if (!a || !v.client_ua) return -1;
+        try {
+            HttpClient h;
+            h.set_timeouts(8000, 20000);
+            const int64_t off = a->content_length - 65536;
+            std::vector<std::string> hdr = {std::string("User-Agent: ") + v.client_ua,
+                                            "Range: bytes=" + std::to_string(off) + "-"};
+            size_t got = 0;
+            long st = h.download(a->url,
+                                 [&](const char*, size_t n) { got += n; return true; },
+                                 {}, 0, hdr);
+            return ((st == 200 || st == 206) && got > 1000) ? 1 : 0;
+        } catch (...) { return 0; }
+    };
+
     std::printf("\ninnertube clients (video %s)\n", test_id.c_str());
     bool any_usable = false;
+    bool any_hls    = false;
     for (size_t i = 0; i < PLAYER_CHAIN_N; ++i) {
         const ClientDef& c = *PLAYER_CHAIN[i];
         VideoInfo v = yt.probe_client(test_id, c);
@@ -381,14 +452,26 @@ static int run_diag(const std::string& test_id) {
         } else if (v.formats.empty()) {
             bad(c.name, "no formats returned");
         } else {
-            char d[160];
-            std::snprintf(d, sizeof d, "%d adaptive, max %dp, audio %lldk",
-                          adaptive, maxh, (long long)(maxabr / 1000));
-            ok(c.name, d);
-            if (adaptive > 0 && with_url == adaptive) any_usable = true;
+            if (!v.hls_url.empty()) any_hls = true;
+            const int tail = tail_probe(v);
+            char d[224];
+            std::snprintf(d, sizeof d, "%d adaptive, max %dp, audio %lldk%s%s",
+                          adaptive, maxh, (long long)(maxabr / 1000),
+                          v.hls_url.empty() ? "" : ", +HLS",
+                          tail == 0 ? " -- CAPPED: 403 near end of stream" : "");
+            if (tail == 0) {
+                // Not counted as a problem: the chain routes around it, and on
+                // a clip short enough to fit under the cap it still works.
+                warn(c.name, d);
+            } else {
+                ok(c.name, d);
+                if (adaptive > 0 && with_url == adaptive) any_usable = true;
+            }
         }
     }
     if (!any_usable) bad("usable client", "none returned fetchable adaptive formats");
+    if (any_hls) ok("hls manifest", "available -- usable for live, and past a byte cap");
+    else         warn("hls manifest", "none offered for this video");
 
     std::printf("\nselection\n");
     auto res = yt.resolve(test_id, Mode::AudioVideo);
@@ -489,6 +572,10 @@ static void usage() {
 "    -d, --download            download to a file\n"
 "    -p, --play                launch mpv\n"
 "        --mpv-args            print the mpv command instead of running it\n"
+"        --hls                 play via the HLS manifest instead of direct URLs\n"
+"                              (-q/--quality does not apply: mpv picks the\n"
+"                               variant; live and HLS fallback included)\n"
+"        --no-hls              never fall back to HLS (live always uses it)\n"
 "    -j, --json                full metadata as JSON\n"
 "    -F, --list-formats        every available format\n"
 "    -L, --ladder              the quality ladder for this video\n"
@@ -694,8 +781,15 @@ static int ytdlp_main(int argc, char** argv) {
         if (o.get_thumbnail) { std::printf("%s\n", info.thumbnail_url.c_str()); printed = true; }
         if (o.get_filename)  { std::printf("%s\n", out_path.c_str()); printed = true; }
         if (o.get_url) {
-            if (pick.video) std::printf("%s\n", pick.video->url.c_str());
-            if (pick.audio && !pick.muxed) std::printf("%s\n", pick.audio->url.c_str());
+            // A live stream's progressive URLs fetch one byte, so printing
+            // them would be worse than useless. The manifest is the real
+            // answer, and it is a single URL covering every track.
+            if (info.is_live_now && !info.hls_url.empty()) {
+                std::printf("%s\n", info.hls_url.c_str());
+            } else {
+                if (pick.video) std::printf("%s\n", pick.video->url.c_str());
+                if (pick.audio && !pick.muxed) std::printf("%s\n", pick.audio->url.c_str());
+            }
             printed = true;
         }
         if (o.dump_json) {
@@ -710,6 +804,20 @@ static int ytdlp_main(int argc, char** argv) {
             printed = true;
         }
         if (printed || o.simulate) continue;
+
+        // ---- live ----
+        // Checked here, after the simulation outputs above, so that asking for
+        // metadata about a live stream (-j, -e, --print, --get-title) still
+        // works exactly as it did. Only the download is impossible: the
+        // formats carry no contentLength, so the engine computes a zero-length
+        // span, writes one byte, and reports success.
+        if (info.is_live_now) {
+            std::fprintf(stderr,
+                "ERROR: [youtube] %s: is a live stream -- not downloadable here"
+                " (use -g for its HLS manifest)\n", id.c_str());
+            ++failures;
+            continue;
+        }
 
         // ---- download ----
         if (o.no_overwrites) {
@@ -806,6 +914,7 @@ int main(int argc, char** argv) {
     int  max_results = 15, connections = 3, volume = -1, want_itag = 0;
     bool json = false, no_resume = false, no_mux = false, no_cache = false;
     bool print_mpv = false, force_any_codec = false, via_ffmpeg = false;
+    HlsPref hls_pref = HlsPref::Auto;
     std::string po_token, cookies_file, pot_provider_url;
     bool use_pot_provider = false;
 
@@ -832,6 +941,8 @@ int main(int argc, char** argv) {
         }
         else if (a == "-p" || a == "--play")     action = "play";
         else if (a == "--mpv-args")            { action = "play"; print_mpv = true; }
+        else if (a == "--hls")                   hls_pref = HlsPref::Force;
+        else if (a == "--no-hls")                hls_pref = HlsPref::Never;
         else if (a == "-j" || a == "--json")     json = true;
         else if (a == "-F" || a == "--list-formats") action = "formats";
         else if (a == "-L" || a == "--ladder")   action = "ladder";
@@ -966,7 +1077,10 @@ int main(int argc, char** argv) {
     const std::string id = extract_id(target);
 
     VideoInfo info = yt.get_stream_formats(id);
-    if (info.formats.empty()) {
+    // An HLS-only response still plays, so it is not a failure. That happens
+    // on a live stream, and on a client that answers SABR for its progressive
+    // formats while still handing back a manifest.
+    if (info.formats.empty() && info.hls_url.empty()) {
         if (info.sabr_only)
             std::fprintf(stderr,
                 "error: every client returned SABR (formats listed, no URLs).\n"
@@ -978,6 +1092,70 @@ int main(int argc, char** argv) {
 
     if (action == "formats") { print_formats(info); return 0; }
     if (action == "ladder")  { print_ladder(info);  return 0; }
+
+    // ----------------------------------------------- live, and HLS-only VOD
+    // Two cases with one shape: a single manifest URL and no usable format
+    // list behind it.
+    //
+    // Live: a live stream has no file behind it. Its adaptive formats do come
+    // back carrying URLs, which is why this used to look like it worked, but
+    // they have no contentLength -- so the downloader computed a zero-length
+    // span, wrote exactly one byte, and reported success.
+    //
+    // HLS-only VOD: a client can answer SABR for every progressive format and
+    // still hand back a manifest (current IOS versions do). fetch_player keeps
+    // that as a last resort, but without this branch it fell through to
+    // Selector::select() over an empty format list and died with "nothing
+    // matches that request" -- making the fallback unreachable.
+    const bool hls_only = info.formats.empty() && !info.hls_url.empty();
+    if (info.is_live_now || hls_only) {
+        if (info.hls_url.empty()) {
+            std::fprintf(stderr,
+                "error: %s is live, but no client in the chain returned an HLS\n"
+                "       manifest -- which is the only transport a live stream has.\n",
+                id.c_str());
+            return 1;
+        }
+        if (action == "download") {
+            if (info.is_live_now)
+                std::fprintf(stderr,
+                    "error: %s is a live stream, so there is no file to download.\n"
+                    "       Play it instead:\n"
+                    "         ytcui-dl -p %s\n"
+                    "       or record the manifest for as long as you want it:\n"
+                    "         ffmpeg -i \"$(ytcui-dl -g %s)\" -c copy out.mkv\n",
+                    id.c_str(), info.url.c_str(), info.url.c_str());
+            else
+                std::fprintf(stderr,
+                    "error: %s came back with an HLS manifest and no fetchable\n"
+                    "       progressive formats, so -d has nothing to range over.\n"
+                    "       Play it:   ytcui-dl -p %s\n"
+                    "       or grab it yourself:\n"
+                    "         ffmpeg -i \"$(ytcui-dl -g %s)\" -c copy out.mp4\n",
+                    id.c_str(), info.url.c_str(), info.url.c_str());
+            return 2;
+        }
+        if (json) {
+            yjw::Writer w;
+            emit_info(w, info, nullptr);
+            std::printf("%s\n", w.str().c_str());
+            return 0;
+        }
+        if (action == "play") {
+            auto args = mpv_args_hls(info.hls_url, mode, info.title, volume, ua_for(info));
+            if (print_mpv) {
+                for (size_t i = 0; i < args.size(); ++i)
+                    std::printf("%s%s", args[i].c_str(), i + 1 < args.size() ? " " : "\n");
+                return 0;
+            }
+            info_msg("%s\n%s - HLS via %s\n", info.title.c_str(),
+                     info.is_live_now ? "LIVE" : "HLS only",
+                     info.client_name ? info.client_name : "?");
+            return spawn_mpv(args);
+        }
+        std::printf("%s\n", info.hls_url.c_str());
+        return 0;
+    }
 
     // ---------------------------------------------------------- selection
     Selection sel;
@@ -1035,18 +1213,40 @@ int main(int argc, char** argv) {
 
     // ---------------------------------------------------------------- play
     if (action == "play") {
-        auto args = mpv_args(sel, mode, info.title, volume, mode != Mode::AudioOnly, ua_for(info));
+        if (hls_pref == HlsPref::Force && info.hls_url.empty()) {
+            std::fprintf(stderr, "error: --hls asked for, but no client returned a manifest\n");
+            return 1;
+        }
+        // A capped client's progressive URLs stop serving about a minute in.
+        // The HLS manifest from that same response does not: probed at the
+        // start, the middle, and 18 s from the end of a 3:33 VOD, it decoded
+        // at every offset. So when the chain had to fall back to a capped
+        // client, the manifest is the better transport, and is used by default.
+        const bool use_hls = !info.hls_url.empty() && hls_pref != HlsPref::Never &&
+                             (hls_pref == HlsPref::Force || capped_and_long(info));
+        auto args = use_hls
+            ? mpv_args_hls(info.hls_url, mode, info.title, volume, ua_for(info))
+            : mpv_args(sel, mode, info.title, volume, mode != Mode::AudioOnly, ua_for(info));
         if (print_mpv) {
             for (size_t i = 0; i < args.size(); ++i)
                 std::printf("%s%s", args[i].c_str(), i + 1 < args.size() ? " " : "\n");
             return 0;
         }
         info_msg("%s\n%s — %s\n", info.title.c_str(), mode_name(mode), sel.describe().c_str());
+        if (use_hls)
+            info_msg("  via HLS - %s's direct URLs are byte-capped\n",
+                     info.client_name ? info.client_name : "?");
+        else if (capped_and_long(info))
+            warn_capped(info);
         return spawn_mpv(args);
     }
 
     // ------------------------------------------------------------ download
     if (action == "download") {
+        // Said before the first byte rather than after a 403 two thirds of the
+        // way in. There is no HLS escape hatch on this path: -d is the ranged,
+        // resumable, byte-exact engine, and a manifest is none of those.
+        if (capped_and_long(info)) warn_capped(info);
         // -x / --remux: skip this project's own chunked engine and hand the
         // URL(s) straight to ffmpeg, which fetches and remuxes/transcodes in
         // one pass. See yt_stream_dl.h for why this is a separate path from
@@ -1132,6 +1332,17 @@ int main(int argc, char** argv) {
     }
 
     // ----------------------------------------------------------- print URLs
+    // --hls asks for the manifest here too, so that `-g --hls` and `-p --hls`
+    // describe the same stream. One URL, not a video/audio pair: the manifest
+    // already carries every track.
+    if (hls_pref == HlsPref::Force) {
+        if (info.hls_url.empty()) {
+            std::fprintf(stderr, "error: --hls asked for, but no client returned a manifest\n");
+            return 1;
+        }
+        std::printf("%s\n", info.hls_url.c_str());
+        return 0;
+    }
     if (mode == Mode::AudioOnly)
         std::printf("%s\n", (sel.audio ? sel.audio : sel.video)->url.c_str());
     else if (mode == Mode::VideoOnly)

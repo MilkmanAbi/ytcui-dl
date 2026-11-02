@@ -1,11 +1,13 @@
 # Build output
 ytcui-dl
+ytcui-we
 test/test_yj
 test/test_client
 test/test_select
 test/test_http
 test/test_live
 test/test_download
+test/test_sqlite
 *.dSYM/
 
 # OS cruft
