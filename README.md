@@ -9,6 +9,15 @@
 > `--cookies` adds real logged-in-session authentication. Details in
 > [Known constraints](#known-constraints).
 > Not sure if PO is properly working, attempted by me and my friend, Claude fixed it up - not too sure if it's functional yet.
+>
+> **Measured correction (2026-11-01):** a token from `--pot-provider` is a
+> *web* BotGuard attestation, and per yt-dlp's own PO-Token guide tokens do not
+> cross platforms -- "a Web PO Token cannot be used on Android or iOS". So it
+> does **not** lift the ANDROID/IOS byte cap described in
+> [Known constraints](#known-constraints), and it cannot rescue a "made for
+> kids" video, which is exactly the case that falls through to those clients.
+> What it is good for is a web-family client. `--cookies` is unaffected by any
+> of this and still does what it says.
 
 A small, header-only YouTube client in C++17. Resolves streams, plays them,
 downloads them. No libcurl, no JSON library, no yt-dlp.
@@ -34,7 +43,7 @@ lift. Concretely, diffed against the old codebase directly:
 | Best download, ever | **Hard-capped at 360p.** `resolve_format_string("best", ...)` only ever picked a *muxed* stream, and itag 18 (360p, ~96 kbps AAC) is the only muxed adaptive format YouTube serves. No amount of asking for "best" got past it. | Video and audio are resolved and downloaded **independently**, then muxed with `ffmpeg` — the actual ceiling is whatever YouTube encoded (2160p60 for ordinary uploads, confirmed 4320p60 HDR / 8K on an 8K upload — see `ENCODING_AND_RESOLUTION.md`) |
 | Download mechanism | One `curl_easy_perform()` call, one connection, no resume, no retry | Parallel chunked engine (default 3 connections, tunable), automatic resume, byte-identical output verified against a checksum test, and adaptive per-chunk retry/split tuned to this CDN's actual behavior (see `Downloader::fetch_span` in `yt_download.h`) |
 | SABR (URL-less format lists) | **Not detected at all.** If InnerTube handed back adaptive formats with no `url` field, the old client had no way to know and would fail with formats that looked fine but weren't fetchable | An explicit SABR gate (`sabr_only`) rejects any response whose formats carry no URLs and advances to the next client in the chain instead of silently settling for garbage |
-| Client chain | `ANDROID → IOS`, both hardcoded, no fallback logic for either SABR or PO-Token walls | `VISIONOS → ANDROID_VR → ANDROID → IOS`, chosen and actively re-tuned against yt-dlp's own current client policy table (see [Known constraints](#known-constraints) — this is a moving target and the README says exactly how to re-tune it) |
+| Client chain | `ANDROID → IOS`, both hardcoded, no fallback logic for either SABR or PO-Token walls | `VISIONOS → ANDROID → IOS → ANDROID_VR`, chosen and actively re-tuned against yt-dlp's own current client policy table (see [Known constraints](#known-constraints) — this is a moving target and the README says exactly how to re-tune it) |
 | User-Agent on media fetch | **Hardcoded to the ANDROID UA**, sent regardless of which client actually resolved the format URL — silently wrong the moment a fallback client won instead | Tracked per-video (`VideoInfo::client_ua`) from whichever client in the chain actually resolved it, and used consistently for every later request against that video (media fetch, `--play`, download) |
 | Audio-only / video-only "just give me a file" | `-x` just meant "download bestaudio," raw, whatever container YouTube served — no transcoding | `-x`/`--remux` (`yt_stream_dl.h`) always produces one finished `.mp3` or `.mp4`, remuxing when the source codec is container-legal and transcoding automatically when it isn't |
 | Diagnostics | None — a failure was just a stack of unexplained errors | `--diag` checks environment → network → every client in the chain → selection → an actual media fetch **near the end of the stream**, specifically because a fetch near the *start* passes even on a client that's about to hit a PO-Token wall |
@@ -66,7 +75,7 @@ before:   1 format,   360p,   ~96 kbps AAC
 after:   29 formats,  2160p,  389 kbps 5.1
 ```
 
-The client chain (currently `VISIONOS -> ANDROID_VR -> ANDROID -> IOS`, see
+The client chain (currently `VISIONOS -> ANDROID -> IOS -> ANDROID_VR`, see
 [Known constraints](#known-constraints) for why it leads with `VISIONOS`) has
 a SABR gate that rejects any response whose adaptive formats carry no URLs, so
 it advances to the next client instead of settling for muxed leftovers.
@@ -74,8 +83,9 @@ it advances to the next client instead of settling for muxed leftovers.
 ## Quick start
 
 ```sh
-make
+make               # builds ytcui-dl and ytcui-we
 make diag          # what works, what doesn't, and why
+make test          # offline suite, including the cookie/SQLite reader
 ```
 
 ```sh
@@ -476,6 +486,77 @@ search 317 KB   4469 us / 22363 allocs / 1157 KB -> 1333 us / 60 allocs / 8.4 KB
 `X-Goog-FieldMask` on every request cuts player responses from ~183 KB to
 ~69 KB with an identical format list.
 
+## ytcui-we: signing in, without shipping a browser
+
+`ytcui-we` is a second, small binary (~140 KB) that gets a logged-in session
+into `ytcui-dl`. It opens **your own default browser**, you sign in to YouTube
+the normal way, and then it lifts that session out of the browser's cookie
+store into a `cookies.txt` that `--cookies` already reads.
+
+```sh
+ytcui-we login          # opens your default browser at YouTube's sign-in page
+ytcui-we export         # writes ~/.config/ytcui-dl/cookies.txt, mode 0600
+ytcui-we check          # confirms the session actually resolves a video
+ytcui-we list           # which browser profiles it can see
+ytcui-we play <url>     # export (if needed) then hand off to ytcui-dl -p
+```
+
+**Be clear about what a session buys, because it is narrower than it looks.**
+
+| | |
+|---|---|
+| It **unlocks** | age-gated, members-only and private videos, plus a logged-in session for search and the bootstrap |
+| It does **not** fix | "made for kids" videos, or the ~60 s byte cap on `ANDROID`/`IOS` media URLs |
+
+Both of those need a GVS PO Token, and a browser session is not one. A
+logged-in web client *does* return an HLS manifest for a "made for kids" video
+-- the only thing that does -- and every segment of it 403s anyway. See the
+dead-end note in [Known constraints](#known-constraints), which exists so this
+doesn't get re-attempted.
+
+**No browser is embedded, on purpose.** The first design here was a minimal
+WebKitGTK window, and it was wrong twice over: it needs ~50 dev packages to
+build, so it cannot be set up unattended, and Google routinely refuses sign-in
+from an unrecognised embedded engine ("this browser or app may not be secure").
+The browser you already use has neither problem -- it is installed, it is
+trusted by Google, and it is where you are already signed in. So `ytcui-we`
+only opens it and reads the result.
+
+- **Browser launch** honours `$BROWSER` first (including the `%s` placeholder
+  convention), then falls back to `xdg-open`, `gio`, `x-www-browser`,
+  `sensible-browser` on Linux/BSD, and `open` on macOS.
+- **Cookie stores read:** Firefox (values are plaintext) and the Chromium
+  family -- Chrome, Chromium, Brave, Edge, Vivaldi, Opera -- whose values are
+  AES-128-CBC encrypted. Flatpak and snap profile locations are searched too.
+  The decryption key comes from the platform: the Keychain on macOS
+  (`security`), `secret-tool` or Chromium's documented fallback password on
+  Linux. Chrome 130+'s 32-byte domain-hash plaintext prefix is detected and
+  stripped.
+- **Safari is not supported**, deliberately: its store is a different binary
+  format (`Cookies.binarycookies`), not SQLite. Sign in with Firefox or a
+  Chromium-family browser instead.
+- **POSIX only** -- Linux, macOS, FreeBSD/OpenBSD/NetBSD -- like the rest of
+  this project. There is no Windows path.
+
+Reading a cookie store means reading SQLite, and that is done by
+`include/yt_sqlite.h`: a ~300-line read-only reader that finds one table in
+`sqlite_schema` and walks its B-tree, including overflow pages. Linking
+`libsqlite3` would have broken the one property this project is about, and
+shelling out to the `sqlite3` CLI was rejected because it is not installed by
+default (confirmed absent on a stock Ubuntu 24.04), so the feature would have
+silently not existed for most users. It is covered by `make test` against a
+fixture built with the real sqlite3 library -- a parser tested only against its
+own output proves nothing -- including a 9000-byte value that cannot fit in one
+page, multi-byte UTF-8, real `v10` ciphertext, and a round trip asserting that
+what `ytcui-we` writes is exactly what `ytcui-dl`'s own parser reads back.
+
+The jar is written `0600` and its directory `0700`. It is a live credential:
+anyone holding it is signed in as you. A throwaway account is the sensible
+choice, since YouTube can flag automated access. Close the browser before
+exporting -- a running browser may still be holding its newest cookies in a
+write-ahead log, which `ytcui-we` warns about rather than silently exporting a
+stale session.
+
 ## Known constraints
 
 - **A version pin is load-bearing.** `ANDROID` is pinned to 20.10.38; newer
@@ -537,6 +618,71 @@ search 317 KB   4469 us / 22363 allocs / 1157 KB -> 1333 us / 60 allocs / 8.4 KB
   in yt-dlp's current `INNERTUBE_CLIENTS` table has no `GVS_PO_TOKEN_POLICY`
   override and no `REQUIRE_JS_PLAYER`, and move it to the front of
   `PLAYER_CHAIN` in `yt_innertube.h`.
+  Re-checked against that table on 2026-11-01: `VISIONOS` is still the only
+  entry with `REQUIRE_JS_PLAYER: False` and no GVS policy, so it keeps the
+  lead. `ANDROID` is pinned at 20.10.38 for a reason that still holds --
+  upstream now ships 21.26.364, and that version answers SABR (0 of 29 formats
+  carried a URL when asked directly). `IOS` upstream is now 21.26.4, which is
+  likewise URL-less; the pinned 20.10.4 still returns 27 URL-carrying formats
+  plus an HLS manifest. `ANDROID_VR` moved from second to last: its player
+  response still looks perfect, 26 adaptive formats all with URLs, and the CDN
+  403s the end of every one, so sitting second it was answering for precisely
+  the videos `VISIONOS` declines and serving none of them.
+- **Live streams play, and only play.** A live response does carry adaptive
+  formats with URLs, but none of them has a `contentLength`, and a ranged GET
+  against one returns a single byte -- which is literally what `-d` used to
+  write while reporting success. The transport that works is the HLS manifest
+  (`streamingData.hlsManifestUrl`), which `VISIONOS` returns for live; mpv and
+  ffmpeg both read HLS natively, so `-p` and `-g` hand it straight over and
+  nothing is downloaded. `-d` on a live stream now refuses with the ffmpeg
+  command to record it yourself. Verified by decoding 60 s straight through a
+  live manifest.
+- **`-q` does not apply to HLS.** On a manifest -- live, `--hls`, or the
+  automatic fallback -- mpv selects the variant itself, and its only lever is
+  `--hls-bitrate` (`no`/`min`/`max`/a rate), which picks by bitrate rather than
+  by height. Honouring `-q` would mean fetching and parsing the master playlist
+  to map a height onto a `BANDWIDTH`, which this doesn't do, so `-q` is
+  silently ignored on that path by design rather than half-honoured.
+- **HLS is also the way past a byte cap, where one is offered.** The same
+  manifest is not subject to the ~60 s GVS cap: probed at the start, the
+  middle, and 18 s from the end of a 3:33 VOD, it decoded at every offset
+  where that client's progressive URLs 403. `--play` switches to it on its own
+  when the resolving client is capped and a manifest exists; `--hls` forces it
+  for `-p` and `-g`, `--no-hls` forbids it. The catch is that the videos that
+  most need it -- "made for kids" -- are served by `ANDROID`, which offers no
+  manifest at all, so this is a real fallback but not a cure for that case.
+- **"Made for kids" videos cannot be fixed tokenlessly, full stop.** `VISIONOS`
+  answers `UNPLAYABLE` ("This video is not available") for them by design --
+  yt-dlp's own table carries the same note -- so the chain falls to `ANDROID`,
+  whose URLs stop serving about a minute in, and which offers no HLS to escape
+  to. Every other tokenless candidate was tried and rejected on measurement:
+  `TVHTML5` and `TVHTML5_SIMPLY` answer "The page needs to be reloaded" (and
+  `LOGIN_REQUIRED`, "Sign in to confirm you're not a bot", on a kids video),
+  `WEB_EMBEDDED_PLAYER` and `web_safari` answer "Video unavailable" without a
+  logged-in session, and `ANDROID_VR` 403s the end of every stream it serves.
+  `ytcui-dl` now says this up front instead of failing two thirds of the way
+  into a download.
+- **The web-family HLS route is a dead end -- measured, 2026-11-01, so nobody
+  retries it.** It looks like the obvious escape from the byte cap, because a
+  web client *does* hand back an `hlsManifestUrl`, and under a Safari UA plus a
+  scraped `signatureTimestamp` it does so even for a "made for kids" video when
+  a logged-in session is attached -- the only thing found that offers a manifest
+  for one at all. It does not work. The master manifest fetches 200, the variant
+  playlists fetch 200, and **every media segment 403s.** That was tested with
+  real web GVS PO Tokens from `bgutil-ytdlp-pot-provider`, across the whole
+  matrix: content binding of the video ID *and* of the exact `visitorData`,
+  token placed in the player request's `serviceIntegrityDimensions` *and* left
+  out, and spliced into the manifest as a path segment the way yt-dlp does it
+  (`manifest_path.rstrip('/') + f'/pot/{po_token}'` -- note: a path segment for
+  manifests, a `pot=` query param only for progressive/DASH format URLs). The
+  splice demonstrably takes effect, since the returned segment URLs contain
+  `pot`. They still 403. The explanation that fits is upstream's own note
+  against `web` in the PO-Token guide table -- "Only SABR formats available" --
+  i.e. the manifest a web client returns is vestigial and simply isn't served
+  any more. The practical upshot: a browser-based fallback engine of this shape
+  cannot be built today, because the real web player's transport is SABR
+  (confirmed directly: its media requests are `POST videoplayback` with ~1.5 KB
+  protobuf bodies), and neither mpv nor ffmpeg speaks that.
 - **No SABR/UMP support.** If every client ends up requiring a PO Token, this
   approach stops working entirely and the gate/error says so rather than
   silently dropping to 360p.
