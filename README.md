@@ -1,33 +1,3 @@
-# ytcui-dl
-
-> **AI Disclosure:** ytcui-dl v1 was written entirely by hand. v2 is a full refactor developed over several months, with help from a friend. AI was used for debugging, testing functionality, and automating the final push to the repository. The project architecture and implementation are my own, while AI assisted with resolving issues during development.
->
-> On PO Tokens specifically: `--po-token` / `--pot-provider` / `--cookies` were
-> attempted by me and my friend and tidied up with Claude's help, and I wasn't
-> sure they were functional. They have since been measured properly — what each
-> one actually does, and the things people assume they do but don't, are written
-> down in [Known constraints](#known-constraints).
-
-A small, header-only YouTube client in C++17. Resolves streams, plays them,
-downloads them. No libcurl, no JSON library, no SQLite, no yt-dlp.
-
-```
-ytcui-dl       218 KB    resolve / play / download
-ytcui-we       139 KB    browser session helper
-headers        5,581 lines across include/
-dependencies   OpenSSL, zlib, pthreads — and nothing else
-shared objs    7 on Linux (libssl, libcrypto, libz, libstdc++, libgcc_s, libc, libm)
-```
-
-Two binaries, one library:
-
-| | |
-|---|---|
-| **`ytcui-dl`** | Everything that touches YouTube: search, format selection, playback through mpv, and the download engine. |
-| **`ytcui-we`** | Opens *your own* default browser so you can sign in, then exports that session as a `cookies.txt` for `ytcui-dl --cookies`. No browser is embedded. |
-
----
-
 ## What's new in this branch
 
 Testing against live YouTube turned up a handful of real breaks. Worth saying
