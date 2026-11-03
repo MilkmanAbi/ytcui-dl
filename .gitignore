@@ -1,6 +1,5 @@
 # Build output
 ytcui-dl
-ytcui-we
 test/test_yj
 test/test_client
 test/test_select
@@ -12,3 +11,8 @@ test/test_sqlite
 
 # OS cruft
 .DS_Store
+/build*/
+/dist/
+__pycache__/
+test/test_audit
+test/test_transfer

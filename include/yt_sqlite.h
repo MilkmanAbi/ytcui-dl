@@ -124,7 +124,7 @@ private:
         return ((uint32_t)buf_[o] << 24) | ((uint32_t)buf_[o + 1] << 16) |
                ((uint32_t)buf_[o + 2] << 8) | buf_[o + 3];
     }
-    bool in_range(size_t o, size_t n) const { return o + n <= buf_.size(); }
+    bool in_range(size_t o, size_t n) const { return o <= buf_.size() && n <= buf_.size() - o; }
 
     // SQLite varint: big-endian 7 bits per byte, up to 8 bytes, with the ninth
     // byte contributing a full 8 bits.

@@ -7,6 +7,8 @@
  */
 
 #include "ytfast.h"
+#include "session.h"
+#include "yt_hls.h"
 #include "yjw.h"
 #include "ytdlp_compat.h"
 
@@ -43,7 +45,7 @@ static void info_msg(const char* fmt, ...) {
 
 static std::string sv2s(std::string_view v) { return std::string(v); }
 
-// Shared with ytcui-we; the implementation is in yt_types.h.
+// Shared with ytcui-dl session; the implementation is in yt_types.h.
 static std::string extract_id(const std::string& s) { return extract_video_id(s); }
 
 // A format's signed URL only works with the exact User-Agent of the client
@@ -217,17 +219,48 @@ static std::vector<std::string> mpv_args(const Selection& sel, Mode mode,
 // of the video+audio pairing mpv_args() does above applies -- mpv picks a
 // variant out of the manifest itself. A separate function rather than a flag
 // on that one, because there is no Selection behind this and nothing to pair.
+static std::vector<std::string> hls_urls(const std::string& url, Mode mode,
+                                        const Quality& q, const char* ua) {
+    HttpClient http;
+    auto response = http.get(url, {std::string("User-Agent: ") + ua});
+    if (response.status != 200) throw std::runtime_error("HLS manifest HTTP " + std::to_string(response.status));
+    auto manifest = HlsManifest::parse(response.body, url);
+    if (manifest.variants.empty()) {
+        if (q.height > 0 || q.max_height > 0)
+            throw std::runtime_error("HLS playlist has no resolution metadata to honor the requested height");
+        return {url};
+    }
+    auto selected = manifest.select(q);
+    if (!selected) throw std::runtime_error("no HLS variant satisfies the quality constraints");
+    auto audio = manifest.audio_for(*selected);
+    if (mode == Mode::AudioOnly && !audio.empty()) return {audio};
+    std::vector<std::string> result{selected->url};
+    if (mode == Mode::AudioVideo && !audio.empty()) result.push_back(audio);
+    return result;
+}
+static void print_hls_formats(const std::string& url, const char* ua) {
+    HttpClient http;
+    auto response = http.get(url, {std::string("User-Agent: ") + ua});
+    if (response.status != 200) throw std::runtime_error("cannot fetch HLS variants");
+    auto manifest = HlsManifest::parse(response.body, url);
+    std::puts("transport  resolution   fps       bandwidth  codecs");
+    for (const auto& variant : manifest.variants)
+        std::printf("HLS        %5dx%-5d %5.1f %12lld  %s\n", variant.width, variant.height,
+                    variant.fps, (long long)variant.bandwidth, variant.codecs.c_str());
+    if (manifest.variants.empty()) std::puts("HLS media playlist; no master resolution metadata");
+}
 static std::vector<std::string> mpv_args_hls(const std::string& url, Mode mode,
-                                             const std::string& title, int volume,
-                                             const char* ua) {
-    std::vector<std::string> a = {"mpv", "--ytdl=no",
-                                  std::string("--user-agent=") + ua};
-    if (volume >= 0)    a.push_back("--volume=" + std::to_string(volume));
+                                           const Quality& q, const std::string& title,
+                                           int volume, const char* ua) {
+    const auto urls = hls_urls(url, mode, q, ua);
+    std::vector<std::string> a = {"mpv", "--ytdl=no", std::string("--user-agent=") + ua};
+    if (volume >= 0) a.push_back("--volume=" + std::to_string(volume));
     if (!title.empty()) a.push_back("--force-media-title=" + title);
-    if      (mode == Mode::AudioOnly) a.push_back("--no-video");
+    if (mode == Mode::AudioOnly) a.push_back("--no-video");
     else if (mode == Mode::VideoOnly) a.push_back("--no-audio");
-    else                              a.push_back("--force-window=yes");
-    a.push_back(url);
+    else a.push_back("--force-window=yes");
+    if (urls.size() > 1) a.push_back("--audio-file=" + urls[1]);
+    a.push_back(urls[0]);
     return a;
 }
 
@@ -572,6 +605,7 @@ static void usage() {
 "    -d, --download            download to a file\n"
 "    -p, --play                launch mpv\n"
 "        --mpv-args            print the mpv command instead of running it\n"
+"  session <command>           browser login/export/check/list/play (session --help)\n"
 "        --hls                 play via the HLS manifest instead of direct URLs\n"
 "                              (-q/--quality does not apply: mpv picks the\n"
 "                               variant; live and HLS fallback included)\n"
@@ -886,7 +920,19 @@ static int ytdlp_main(int argc, char** argv) {
     return failures ? 1 : 0;
 }
 
-int main(int argc, char** argv) {
+static int positive_number(const std::string& text, const char* option) {
+    size_t used = 0;
+    long long value = 0;
+    try { value = std::stoll(text, &used); } catch (...) { throw std::runtime_error(std::string(option) + " needs a positive integer"); }
+    if (used != text.size() || value <= 0 || value > 2147483647)
+        throw std::runtime_error(std::string(option) + " needs a positive integer");
+    return static_cast<int>(value);
+}
+static int application(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "session") {
+        argv[1] = argv[0];
+        return ytfast::session::run(argc - 1, argv + 1);
+    }
     // Multi-call: behave like yt-dlp when invoked under that name (a symlink
     // is enough) or when asked explicitly. The two flag sets genuinely
     // conflict -- -q, -a, -c and -s all mean different things -- so they stay
@@ -952,10 +998,10 @@ int main(int argc, char** argv) {
             const std::string v = next("--quality");
             if      (v == "best")  q.height = 0;
             else if (v == "worst" || v == "lowest") q = Quality::lowest();
-            else                   q.height = std::atoi(v.c_str());
+            else                   q.height = positive_number(v, "--quality");
         }
-        else if (a == "--max-height") q.max_height = std::atoi(next("--max-height").c_str());
-        else if (a == "--fps")        q.fps = std::atoi(next("--fps").c_str());
+        else if (a == "--max-height") q.max_height = positive_number(next("--max-height"), "--max-height");
+        else if (a == "--fps")        q.fps = positive_number(next("--fps"), "--fps");
         else if (a == "--vcodec")    { vcodec_buf    = next("--vcodec");    q.vcodec = vcodec_buf; }
         else if (a == "--acodec")    { acodec_buf    = next("--acodec");    q.acodec = acodec_buf; }
         else if (a == "--container") { container_buf = next("--container"); q.container = container_buf; }
@@ -1090,8 +1136,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (action == "formats") { print_formats(info); return 0; }
-    if (action == "ladder")  { print_ladder(info);  return 0; }
+    if (action == "formats" || action == "ladder") {
+        if (!info.hls_url.empty() && (info.is_live_now || info.formats.empty() || hls_pref == HlsPref::Force))
+            print_hls_formats(info.hls_url, ua_for(info));
+        else if (action == "formats") print_formats(info);
+        else print_ladder(info);
+        return 0;
+    }
 
     // ----------------------------------------------- live, and HLS-only VOD
     // Two cases with one shape: a single manifest URL and no usable format
@@ -1109,6 +1160,9 @@ int main(int argc, char** argv) {
     // matches that request" -- making the fallback unreachable.
     const bool hls_only = info.formats.empty() && !info.hls_url.empty();
     if (info.is_live_now || hls_only) {
+        if (!info.hls_url.empty() && (action == "formats" || action == "ladder")) {
+            print_hls_formats(info.hls_url, ua_for(info)); return 0;
+        }
         if (info.hls_url.empty()) {
             std::fprintf(stderr,
                 "error: %s is live, but no client in the chain returned an HLS\n"
@@ -1142,7 +1196,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (action == "play") {
-            auto args = mpv_args_hls(info.hls_url, mode, info.title, volume, ua_for(info));
+            auto args = mpv_args_hls(info.hls_url, mode, q, info.title, volume, ua_for(info));
             if (print_mpv) {
                 for (size_t i = 0; i < args.size(); ++i)
                     std::printf("%s%s", args[i].c_str(), i + 1 < args.size() ? " " : "\n");
@@ -1153,7 +1207,8 @@ int main(int argc, char** argv) {
                      info.client_name ? info.client_name : "?");
             return spawn_mpv(args);
         }
-        std::printf("%s\n", info.hls_url.c_str());
+        for (const auto& url : hls_urls(info.hls_url, mode, q, ua_for(info)))
+            std::printf("%s\n", url.c_str());
         return 0;
     }
 
@@ -1225,7 +1280,7 @@ int main(int argc, char** argv) {
         const bool use_hls = !info.hls_url.empty() && hls_pref != HlsPref::Never &&
                              (hls_pref == HlsPref::Force || capped_and_long(info));
         auto args = use_hls
-            ? mpv_args_hls(info.hls_url, mode, info.title, volume, ua_for(info))
+            ? mpv_args_hls(info.hls_url, mode, q, info.title, volume, ua_for(info))
             : mpv_args(sel, mode, info.title, volume, mode != Mode::AudioOnly, ua_for(info));
         if (print_mpv) {
             for (size_t i = 0; i < args.size(); ++i)
@@ -1333,14 +1388,14 @@ int main(int argc, char** argv) {
 
     // ----------------------------------------------------------- print URLs
     // --hls asks for the manifest here too, so that `-g --hls` and `-p --hls`
-    // describe the same stream. One URL, not a video/audio pair: the manifest
-    // already carries every track.
+    // describe the same selected HLS variant, including external audio when present.
     if (hls_pref == HlsPref::Force) {
         if (info.hls_url.empty()) {
             std::fprintf(stderr, "error: --hls asked for, but no client returned a manifest\n");
             return 1;
         }
-        std::printf("%s\n", info.hls_url.c_str());
+        for (const auto& url : hls_urls(info.hls_url, mode, q, ua_for(info)))
+            std::printf("%s\n", url.c_str());
         return 0;
     }
     if (mode == Mode::AudioOnly)
@@ -1352,4 +1407,12 @@ int main(int argc, char** argv) {
         if (sel.audio && !sel.muxed) std::printf("%s\n", sel.audio->url.c_str());
     }
     return 0;
+}
+
+int main(int argc, char** argv) {
+    try { return application(argc, argv); }
+    catch (const std::exception& error) {
+        std::fprintf(stderr, "error: %s\n", error.what());
+        return 1;
+    }
 }

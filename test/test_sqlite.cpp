@@ -189,12 +189,12 @@ static void test_chromium(const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
-// The round trip that actually matters: what ytcui-we writes must be what
+// The round trip that actually matters: what ytcui-dl session writes must be what
 // ytcui-dl reads. These are two different parsers in two different files, and
 // a mismatch (a missing #HttpOnly_ prefix, a dropped tab) would silently cost
 // the session its auth.
 static void test_roundtrip(const std::string& path) {
-    printf("\nnetscape round trip (ytcui-we writes -> ytcui-dl reads)\n");
+    printf("\nnetscape round trip (ytcui-dl session writes -> ytcui-dl reads)\n");
     browser::Profile p;
     p.engine = browser::Engine::Firefox;
     p.cookie_db = path;
@@ -202,7 +202,7 @@ static void test_roundtrip(const std::string& path) {
     browser::read_cookies(p, v);
     CHECK(!v.empty(), "no cookies to round trip");
 
-    const std::string tmp = "/tmp/ytcui-we-test-cookies.txt";
+    const std::string tmp = "/tmp/ytcui-dl-session-test-cookies.txt";
     std::string err;
     CHECK(browser::write_netscape(tmp, v, &err), "write failed: %s", err.c_str());
 
@@ -213,7 +213,7 @@ static void test_roundtrip(const std::string& path) {
 
     // The real consumer.
     auto& yt = InnertubeClient::get_instance();
-    CHECK(yt.set_cookies_file(tmp), "ytcui-dl could not read what ytcui-we wrote");
+    CHECK(yt.set_cookies_file(tmp), "ytcui-dl could not read what ytcui-dl session wrote");
 
     // An httponly cookie is written with the #HttpOnly_ prefix; if ytcui-dl's
     // reader did not strip it, SAPISID would vanish and auth would silently

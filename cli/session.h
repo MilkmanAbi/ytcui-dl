@@ -1,5 +1,6 @@
+#pragma once
 /*
- * ytcui-we — session helper for ytcui-dl
+ * ytcui-dl session — session helper for ytcui-dl
  *
  * "we" for web session. It opens your own default browser so you can sign in
  * to YouTube normally, then lifts that session out of the browser's cookie
@@ -39,6 +40,7 @@
 
 #include <unistd.h>
 
+namespace ytfast::session {
 using namespace ytfast;
 
 static const char* SIGNIN_URL =
@@ -70,12 +72,12 @@ static void ensure_parent(const std::string& path) {
 
 static void usage() {
     std::printf(
-"ytcui-we %s — browser session helper for ytcui-dl\n"
+"ytcui-dl session %s — browser session helper for ytcui-dl\n"
 "\n"
 "Opens your own default browser to sign in to YouTube, then exports that\n"
 "session as a cookies.txt that ytcui-dl can use.\n"
 "\n"
-"usage: ytcui-we <command> [options]\n"
+"usage: ytcui-dl session <command> [options]\n"
 "\n"
 "commands:\n"
 "  login              open the default browser at YouTube's sign-in page\n"
@@ -115,7 +117,7 @@ static bool pick_profile(const std::string& want_browser,
         }
         out.cookie_db = want_profile;
         // Firefox's file is named cookies.sqlite; Chromium's is "Cookies".
-        const bool ff = want_profile.find("cookies.sqlite") != std::string::npos;
+        const bool ff = want_browser == "firefox" || want_profile.find("cookies.sqlite") != std::string::npos;
         out.engine  = ff ? browser::Engine::Firefox : browser::Engine::Chromium;
         out.browser = ff ? "firefox" : (want_browser.empty() ? "chrome" : want_browser);
         out.label   = out.browser + " / (explicit path)";
@@ -134,14 +136,14 @@ static bool pick_profile(const std::string& want_browser,
             "error: no browser cookie store found.\n"
             "       Looked for Firefox and the Chromium family under your home\n"
             "       directory (including flatpak and snap locations).\n"
-            "       Sign in once with 'ytcui-we login', or point at the file\n"
+            "       Sign in once with 'ytcui-dl session login', or point at the file\n"
             "       directly with --profile <path to cookies.sqlite|Cookies>.\n");
         return false;
     }
     if (!want_browser.empty()) {
         for (const auto& p : found)
             if (p.browser == want_browser) { out = p; return true; }
-        std::fprintf(stderr, "error: no profile found for '%s'. Try 'ytcui-we list'.\n",
+        std::fprintf(stderr, "error: no profile found for '%s'. Try 'ytcui-dl session list'.\n",
                      want_browser.c_str());
         return false;
     }
@@ -184,7 +186,7 @@ static int cmd_login(bool print_only) {
     }
     std::printf(
         "\nSign in there, then come back and run:\n"
-        "    ytcui-we export\n"
+        "    ytcui-dl session export\n"
         "\nUse a throwaway account if you would rather not point your main one\n"
         "at a command line tool -- YouTube can flag automated access.\n"
         "Close the browser before exporting, or recent cookies may still be\n"
@@ -206,7 +208,7 @@ static int cmd_export(const std::string& jar, const std::string& want_browser,
     if (cookies.empty()) {
         std::fprintf(stderr,
             "error: %s has no youtube.com/google.com cookies.\n"
-            "       Sign in first:  ytcui-we login\n", p.label.c_str());
+            "       Sign in first:  ytcui-dl session login\n", p.label.c_str());
         if (r.undecryptable)
             std::fprintf(stderr,
                 "       (%d cookie(s) were present but could not be decrypted --\n"
@@ -243,7 +245,7 @@ static int cmd_export(const std::string& jar, const std::string& want_browser,
 
 static int cmd_check(const std::string& jar, const std::string& target) {
     if (!browser::is_file(jar)) {
-        std::fprintf(stderr, "error: no cookie jar at %s — run 'ytcui-we export'\n",
+        std::fprintf(stderr, "error: no cookie jar at %s — run 'ytcui-dl session export'\n",
                      jar.c_str());
         return 1;
     }
@@ -265,7 +267,7 @@ static int cmd_check(const std::string& jar, const std::string& target) {
     if (info.formats.empty() && info.hls_url.empty()) {
         std::fprintf(stderr,
             "  FAILED — no playable formats. The session may be stale; re-run\n"
-            "  'ytcui-we login' and 'ytcui-we export'.\n");
+            "  'ytcui-dl session login' and 'ytcui-dl session export'.\n");
         return 1;
     }
     std::printf("  ok: %s\n", info.title.c_str());
@@ -284,7 +286,7 @@ static int cmd_check(const std::string& jar, const std::string& target) {
 // Convenience: hand straight off to ytcui-dl with the session attached.
 static int cmd_play(const std::string& jar, int argc, char** argv, int first) {
     if (!browser::is_file(jar)) {
-        std::fprintf(stderr, "error: no cookie jar at %s — run 'ytcui-we export'\n",
+        std::fprintf(stderr, "error: no cookie jar at %s — run 'ytcui-dl session export'\n",
                      jar.c_str());
         return 1;
     }
@@ -295,23 +297,13 @@ static int cmd_play(const std::string& jar, int argc, char** argv, int first) {
     for (auto& s : args) cargv.push_back(const_cast<char*>(s.c_str()));
     cargv.push_back(nullptr);
 
-    // Prefer a sibling binary over $PATH, so a build directory works without
-    // installing anything.
-    std::string self = argv[0];
-    const size_t slash = self.rfind('/');
-    if (slash != std::string::npos) {
-        const std::string sib = self.substr(0, slash + 1) + "ytcui-dl";
-        if (browser::is_file(sib)) {
-            cargv[0] = const_cast<char*>(sib.c_str());
-            ::execv(sib.c_str(), cargv.data());
-        }
-    }
-    ::execvp("ytcui-dl", cargv.data());
+    // The integrated command re-executes the same program with playback flags.
+    ::execvp(argv[0], cargv.data());
     std::fprintf(stderr, "error: could not run ytcui-dl (not in PATH?)\n");
     return 127;
 }
 
-int main(int argc, char** argv) {
+inline int run(int argc, char** argv) {
     if (argc < 2) { usage(); return 1; }
 
     std::string cmd, jar = default_jar(), want_browser, want_profile;
@@ -355,3 +347,5 @@ int main(int argc, char** argv) {
     usage();
     return 2;
 }
+
+} // namespace ytfast::session

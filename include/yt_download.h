@@ -28,6 +28,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <fstream>
+#include <openssl/sha.h>
+#include <sys/file.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -116,30 +119,20 @@ class Downloader {
 public:
     // Fetch `url` into `path`.
     static DownloadResult fetch(const std::string& url,
-                                const std::string& path,
+                                const std::string& final_path,
                                 const DownloadOptions& opt = {}) {
         using clock = std::chrono::steady_clock;
         const auto started = clock::now();
         DownloadResult res;
 
-        int64_t total = probe_size(url, opt);
-
-        // Resume only makes sense against a known total and an existing prefix.
-        int64_t have = 0;
-        if (opt.resume && total > 0) {
-            struct stat st{};
-            if (::stat(path.c_str(), &st) == 0 && st.st_size > 0) {
-                if (st.st_size >= total) {           // already complete
-                    res.ok = true;
-                    res.bytes = st.st_size;
-                    res.status = 200;
-                    res.seconds = elapsed(started);
-                    return res;
-                }
-                have = st.st_size;
-            }
+        struct stat existing{};
+        if (::lstat(final_path.c_str(), &existing) == 0) {
+            res.error = "output already exists: " + final_path;
+            return res;
         }
-
+        const std::string path = final_path + ".part";
+        int64_t total = probe_size(url, opt);
+        int64_t have = 0; // Parallel completion is established by its ledger, never file size.
         // googlevideo's CDN 403s two kinds of request against these signed
         // URLs: a plain unranged GET, and a Range request that spans too much
         // of the stream (empirically close to a minute of playback at the
@@ -166,6 +159,15 @@ public:
             if (::stat(path.c_str(), &st) == 0 && st.st_size == 0) ::unlink(path.c_str());
         }
 
+        if (res.ok) {
+            // link() creates the final name exclusively, so a file appearing
+            // during a transfer is never overwritten by finalization.
+            if (::link(path.c_str(), final_path.c_str()) != 0) {
+                res.ok = false; res.error = "cannot finalize output: " + std::string(std::strerror(errno));
+            } else {
+                ::unlink(path.c_str()); ::unlink((path + ".ranges").c_str());
+            }
+        }
         res.seconds = elapsed(started);
         return res;
     }
@@ -273,7 +275,9 @@ private:
         DownloadResult res;
         // "r+b" for resume: "wb" truncates, which would leave a hole of zeros
         // at the head of the file after seeking to the offset.
-        FILE* fp = std::fopen(path.c_str(), have > 0 ? "r+b" : "wb");
+        int serial_fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        FILE* fp = serial_fd < 0 ? nullptr : ::fdopen(serial_fd, "wb");
+        if (!fp && serial_fd >= 0) ::close(serial_fd);
         if (!fp) { res.error = "cannot open " + path + ": " + std::strerror(errno); return res; }
         if (have > 0) std::fseek(fp, 0, SEEK_END);
 
@@ -318,7 +322,7 @@ private:
         } catch (const std::exception& e) {
             res.error = e.what();
         }
-        std::fclose(fp);
+        if (std::fclose(fp) != 0) write_fail = true;
 
         res.bytes     = have + got;
         res.cancelled = cancelled;
@@ -398,7 +402,7 @@ private:
                 continue;
             }
             if (pwrite_failed) { err = "pwrite failed"; return false; }
-            if (last_status == 200 || last_status == 206) return true;
+            if (last_status == 206 && written == len) return true;
             // A retry (or a split) re-fetches these bytes, so undo the credit
             // -- otherwise done_bytes and the final size check double-count.
             done_bytes.fetch_sub(written);
@@ -428,8 +432,14 @@ private:
                                         int64_t total, int64_t have,
                                         std::chrono::steady_clock::time_point t0) {
         DownloadResult res;
-        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT, 0644);
+        int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
         if (fd < 0) { res.error = "cannot open " + path + ": " + std::strerror(errno); return res; }
+        if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+            ::close(fd); res.error = "download is already active"; return res;
+        }
+        struct stat partial_state{};
+        const bool valid_partial = ::fstat(fd, &partial_state) == 0 &&
+                                   S_ISREG(partial_state.st_mode) && partial_state.st_size == total;
         // ftruncate extends without touching existing bytes, so a resumed
         // prefix survives; it only pads the new tail with zeros to be filled in.
         if (::ftruncate(fd, total) != 0) {
@@ -446,11 +456,42 @@ private:
         if (chunk < kMinChunk) chunk = kMinChunk;
         if (chunk > kMaxChunk) chunk = kMaxChunk;
         const int64_t n_chunks = (total + chunk - 1) / chunk;
-        // Resume: skip chunks fully covered by what is already on disk. A
-        // chunk straddling `have` gets refetched whole -- pwrite makes that
-        // an overwrite of identical bytes, not corruption.
-        const int64_t start_chunk = have > 0 ? have / chunk : 0;
-
+        const std::string ledger = path + ".ranges";
+        unsigned char hash[SHA256_DIGEST_LENGTH];
+        const std::string identity = url + ":" + std::to_string(total) + ":" + std::to_string(chunk);
+        SHA256(reinterpret_cast<const unsigned char*>(identity.data()), identity.size(), hash);
+        const char hex[] = "0123456789abcdef";
+        std::string key;
+        for (unsigned char value : hash) { key += hex[value >> 4]; key += hex[value & 15]; }
+        std::vector<unsigned char> completed(static_cast<size_t>(n_chunks), 0);
+        if (opt.resume && valid_partial) {
+            std::ifstream input(ledger);
+            std::string saved; input >> saved;
+            if (saved == key) {
+                int64_t index;
+                while (input >> index) if (index >= 0 && index < n_chunks)
+                    completed[static_cast<size_t>(index)] = 1;
+            }
+        }
+        have = 0;
+        for (int64_t index = 0; index < n_chunks; ++index)
+            if (completed[static_cast<size_t>(index)]) have += std::min(chunk, total - index * chunk);
+        auto save_ledger = [&]() {
+            std::string temporary = ledger + ".tmp.XXXXXX";
+            int map_fd = ::mkstemp(temporary.data());
+            if (map_fd < 0) return false;
+            FILE* map = ::fdopen(map_fd, "w");
+            if (!map) { ::close(map_fd); ::unlink(temporary.c_str()); return false; }
+            std::fprintf(map, "%s\n", key.c_str());
+            for (int64_t index = 0; index < n_chunks; ++index)
+                if (completed[static_cast<size_t>(index)]) std::fprintf(map, "%lld\n", (long long)index);
+            bool ok = std::fflush(map) == 0;
+            if (::fsync(map_fd) != 0) ok = false;
+            if (std::fclose(map) != 0) ok = false;
+            if (ok && ::rename(temporary.c_str(), ledger.c_str()) == 0) return true;
+            ::unlink(temporary.c_str()); return false;
+        };
+        const int64_t start_chunk = 0;
         std::atomic<int64_t> next_chunk{start_chunk};
         std::atomic<int64_t> done_bytes{have};
         std::atomic<bool>    stop{false};
@@ -458,10 +499,13 @@ private:
         std::string          first_error;
         const auto base_hdr = headers(opt);
 
+        std::atomic<int> active{n_conn};
         auto worker = [&] {
+            struct Done { std::atomic<int>& active; ~Done() { --active; } } done{active};
             for (;;) {
                 int64_t idx = next_chunk.fetch_add(1);
                 if (idx >= n_chunks || stop.load()) return;
+                if (completed[static_cast<size_t>(idx)]) continue;
                 const int64_t off = idx * chunk;
                 const int64_t len = (off + chunk > total) ? total - off : chunk;
 
@@ -471,6 +515,14 @@ private:
                     if (first_error.empty()) first_error = err.empty() ? "download failed" : err;
                     stop.store(true);
                     return;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(err_mu);
+                    if (::fsync(fd) != 0) {
+                        first_error = "cannot sync downloaded chunk"; stop = true; return;
+                    }
+                    completed[static_cast<size_t>(idx)] = 1;
+                    if (!save_ledger()) { first_error = "cannot commit resume ledger"; stop = true; return; }
                 }
             }
         };
@@ -521,7 +573,7 @@ private:
                     stop.store(true);
                     break;
                 }
-                if (finished && got >= total) break;
+                if ((finished && got >= total) || active.load() == 0) break;
             }
         }
 

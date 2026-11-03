@@ -1,0 +1,212 @@
+name: CI
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: '17 3 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Validate workflows and POSIX script
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          gh release download v1.7.12 --repo rhysd/actionlint --pattern actionlint_1.7.12_linux_amd64.tar.gz --dir "$RUNNER_TEMP"
+          echo '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  '"$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/actionlint_1.7.12_linux_amd64.tar.gz" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint"
+          shellcheck scripts/ci-posix.sh
+
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: Linux GCC 12, os: ubuntu-22.04, cc: gcc-12, cxx: g++-12, packages: 'g++-12', flags: '', package: linux-x86_64}
+          - {name: Linux GCC 13, os: ubuntu-24.04, cc: gcc-13, cxx: g++-13, packages: 'g++-13', flags: '', package: ''}
+          - {name: Linux GCC 14, os: ubuntu-24.04, cc: gcc-14, cxx: g++-14, packages: 'g++-14', flags: '', package: ''}
+          - {name: Linux Clang 16, os: ubuntu-24.04, cc: clang-16, cxx: clang++-16, packages: 'clang-16', flags: '', package: ''}
+          - {name: Linux Clang 18 libc++, os: ubuntu-24.04, cc: clang-18, cxx: clang++-18, packages: 'clang-18 libc++-18-dev libc++abi-18-dev', flags: '-stdlib=libc++ -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_DEBUG', package: ''}
+          - {name: Linux ARM64, os: ubuntu-24.04-arm, cc: gcc, cxx: g++, packages: 'g++', flags: '', package: linux-aarch64}
+          - {name: Linux current, os: ubuntu-latest, cc: gcc, cxx: g++, packages: 'g++', flags: '', package: ''}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build openssl libssl-dev zlib1g-dev ${{ matrix.packages }}
+      - name: Configure with warnings as errors
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DYTDL_WERROR=ON '-DCMAKE_CXX_FLAGS=${{ matrix.flags }}'
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure --output-junit results.xml
+      - name: Install and verify archive
+        if: matrix.package != ''
+        run: python3 scripts/package.py --name ytcui-dl-${{ matrix.package }}
+      - uses: actions/upload-artifact@v7
+        if: matrix.package != ''
+        with:
+          name: package-${{ matrix.package }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-${{ matrix.name }}
+          path: |
+            build/results.xml
+            build/Testing/Temporary/*.log
+
+  macos:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-15, package: macos-aarch64}
+          - {os: macos-15-intel, package: macos-x86_64}
+          - {os: macos-26, package: ''}
+          - {os: macos-26-intel, package: ''}
+    steps:
+      - uses: actions/checkout@v7
+      - run: brew install ninja openssl@3 zlib
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DYTDL_WERROR=ON "-DCMAKE_PREFIX_PATH=$(brew --prefix openssl@3);$(brew --prefix zlib)"
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure --output-junit results.xml
+      - if: matrix.package != ''
+        run: python3 scripts/package.py --name ytcui-dl-${{ matrix.package }}
+      - uses: actions/upload-artifact@v7
+        if: matrix.package != ''
+        with:
+          name: package-${{ matrix.package }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-${{ matrix.os }}
+          path: |
+            build/results.xml
+            build/Testing/Temporary/*.log
+
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y ninja-build openssl libssl-dev zlib1g-dev
+      - run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DYTDL_SANITIZERS=ON -DYTDL_WERROR=ON -DCMAKE_CXX_COMPILER=clang++
+      - run: cmake --build build --parallel 2
+      - name: Repeat tests with restrictive umask and temporary path containing spaces
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          mkdir -p "$RUNNER_TEMP/ytcui-dl test space"
+          export TMPDIR="$RUNNER_TEMP/ytcui-dl test space"
+          umask 077
+          ctest --test-dir build --output-on-failure --repeat until-fail:3
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-sanitizers
+          path: build/Testing/Temporary/*.log
+
+  make:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get update && sudo apt-get install -y openssl libssl-dev zlib1g-dev
+      - run: make test JOBS=2
+      - run: make install PREFIX="$RUNNER_TEMP/install space" JOBS=2
+      - run: python3 test/test_cli.py "$RUNNER_TEMP/install space/bin/ytcui-dl"
+      - run: make clean && test ! -f ./ytcui-dl && test ! -f build/ytcui-dl
+
+  alpine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and run with musl
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euxc '
+            apk add --no-cache build-base cmake ninja openssl openssl-dev zlib-dev python3
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DYTDL_WERROR=ON
+            cmake --build build --parallel 2
+            ctest --test-dir build --output-on-failure
+            python3 scripts/package.py --name ytcui-dl-linux-musl-x86_64
+          '
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-linux-musl-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  bsd:
+    name: ${{ matrix.os }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [freebsd, openbsd, netbsd]
+    steps:
+      - uses: actions/checkout@v7
+      - name: FreeBSD
+        if: matrix.os == 'freebsd'
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg install -y cmake ninja openssl python3
+          run: sh scripts/ci-posix.sh freebsd
+      - name: OpenBSD
+        if: matrix.os == 'openbsd'
+        uses: vmactions/openbsd-vm@v1
+        with:
+          usesh: true
+          prepare: pkg_add cmake ninja openssl python3
+          run: sh scripts/ci-posix.sh openbsd
+      - name: NetBSD
+        if: matrix.os == 'netbsd'
+        uses: vmactions/netbsd-vm@v1
+        with:
+          usesh: true
+          prepare: /usr/sbin/pkg_add cmake ninja-build openssl python312
+          run: PATH=/usr/pkg/bin:/usr/pkg/sbin:$PATH sh scripts/ci-posix.sh netbsd
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.os }}-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-${{ matrix.os }}
+          path: build/Testing/Temporary/*.log
