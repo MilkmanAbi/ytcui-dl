@@ -1,5 +1,6 @@
 $ErrorActionPreference = 'Stop'
-$linuxProject = (& wsl.exe -- wslpath -a $PSScriptRoot).Trim()
-if ($LASTEXITCODE) { throw 'WSL is required. Build ytcui-dl inside your WSL distribution first.' }
-& wsl.exe --cd $linuxProject -- ./build/ytcui-dl @args
+$translatedPath = & wsl.exe --exec wslpath -a ($PSScriptRoot.Replace('\', '/'))
+if ($LASTEXITCODE -or !$translatedPath) { throw 'WSL is required. Build ytcui-dl inside your WSL distribution first.' }
+$linuxProject = $translatedPath.Trim()
+& wsl.exe --cd $linuxProject --exec ./build/ytcui-dl @args
 exit $LASTEXITCODE
