@@ -207,6 +207,12 @@ private:
                 if (SSL_CTX_load_verify_locations(ctx_, p, nullptr)) break;
         }
         SSL_CTX_set_verify(ctx_, SSL_VERIFY_PEER, nullptr);
+        if (const char* custom_ca = std::getenv("SSL_CERT_FILE"); custom_ca && *custom_ca) {
+            if (SSL_CTX_load_verify_locations(ctx_, custom_ca, nullptr) != 1) {
+                SSL_CTX_free(ctx_); ctx_ = nullptr;
+                throw std::runtime_error("cannot load SSL_CERT_FILE trust bundle");
+            }
+        }
         // SSL_SESS_CACHE_NO_INTERNAL_STORE: we keep sessions ourselves, keyed
         // by host, so OpenSSL's own client cache would just duplicate them.
         SSL_CTX_set_session_cache_mode(

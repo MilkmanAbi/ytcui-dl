@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-import sqlite3
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,14 +22,10 @@ with tempfile.TemporaryDirectory(prefix='ytcui cli space ') as temporary:
     assert 'fixture-browser' in run(['session', 'login', '--print-command'])
     run(['session', 'export', '--profile', str(root/'missing')], False)
     run(['session', 'check'], False)
-    db = sqlite3.connect(root/'cookies.sqlite')
-    db.execute('CREATE TABLE moz_cookies (host TEXT,name TEXT,value TEXT,path TEXT,expiry INTEGER,isSecure INTEGER,isHttpOnly INTEGER)')
-    db.execute("INSERT INTO moz_cookies VALUES ('.youtube.com','SAPISID','synthetic-test-cookie','/',0,1,1)")
-    db.execute("INSERT INTO moz_cookies VALUES ('youtube.com.attacker.test','bad','synthetic','/',0,1,1)")
-    db.commit(); db.close()
+    shutil.copy2(Path(__file__).resolve().parent/'fixtures/browser_cookies.sqlite', root/'cookies.sqlite')
     run(['session','export','--browser','firefox','--profile',str(root/'cookies.sqlite'),'-o',str(root/'jar.txt')])
     jar = (root/'jar.txt').read_text()
-    assert 'synthetic-test-cookie' in jar and 'attacker' not in jar
+    assert 'ff-sapisid-value' in jar and 'example.com' not in jar
     assert (root/'jar.txt').stat().st_mode & 0o777 == 0o600
     assert not (root/'config').exists(), 'explicit export should not touch default credential location'
     result = subprocess.run(['ytcui-dl','--version'], cwd=root, env=env, capture_output=True, timeout=10)

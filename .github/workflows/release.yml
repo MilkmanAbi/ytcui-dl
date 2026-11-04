@@ -3,26 +3,50 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag to verify and publish
+        required: true
+        type: string
 permissions:
   contents: read
+  actions: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 jobs:
   version:
     runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      commit: ${{ steps.version.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
-      - name: Require version tag matching source
-        shell: bash
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Require a tag matching VERSION
+        id: version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          test "$GITHUB_REF_TYPE" = tag
-          test "$GITHUB_REF_NAME" = "v$(tr -d '\r\n' < VERSION)"
+          test "$RELEASE_TAG" = "v$(tr -d '\r\n' < VERSION)"
+          test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 "$RELEASE_TAG")"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
   verify:
     needs: version
+    permissions:
+      contents: read
+      actions: read
     uses: ./.github/workflows/ci.yml
+    with:
+      source_ref: ${{ needs.version.outputs.commit }}
   publish:
-    needs: verify
+    needs: [version, verify]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8
@@ -30,7 +54,9 @@ jobs:
           pattern: package-*
           path: release-assets
           merge-multiple: true
-      - name: Publish verified archives and checksums
+      - name: Publish or verify release without replacing existing binaries
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" release-assets/* --verify-tag --title "ytcui-dl $GITHUB_REF_NAME" --generate-notes
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.version.outputs.commit }}
+        run: python3 scripts/publish-release.py release-assets
