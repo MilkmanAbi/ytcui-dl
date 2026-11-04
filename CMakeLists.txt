@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(ytcui_dl VERSION 0.6.0 LANGUAGES CXX)
+project(ytcui_dl VERSION 0.6.1 LANGUAGES CXX)
 if(WIN32)
   message(FATAL_ERROR "ytcui-dl uses POSIX transport/session APIs. Use WSL on Windows.")
 endif()

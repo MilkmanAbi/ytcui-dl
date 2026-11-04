@@ -1,4 +1,4 @@
-# ytcui-dl 0.6.0
+# ytcui-dl 0.6.1
 
 [![CI](https://github.com/MilkmanAbi/ytcui-dl/actions/workflows/ci.yml/badge.svg)](https://github.com/MilkmanAbi/ytcui-dl/actions/workflows/ci.yml)
 

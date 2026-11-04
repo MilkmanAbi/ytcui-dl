@@ -84,7 +84,7 @@ static void usage() {
 "  export             read the browser's cookies into a cookies.txt\n"
 "  check [<url>]      verify the exported session against YouTube\n"
 "  list               show the browser profiles that were found\n"
-"  play <url> [...]   export if needed, then run ytcui-dl -p with the session\n"
+"  play <url> [...]   run ytcui-dl -p with the exported session\n"
 "\n"
 "options:\n"
 "  -o, --output <f>   cookie jar path (default: %s)\n"

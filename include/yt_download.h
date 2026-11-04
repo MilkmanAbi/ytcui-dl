@@ -39,6 +39,7 @@
 
 #include "yt_http.h"
 #include "yt_types.h"
+#include "yt_process.h"
 
 namespace ytfast {
 
@@ -604,7 +605,7 @@ private:
 // is absent the two files simply remain, and the caller can say so.
 // ---------------------------------------------------------------------------
 inline bool have_ffmpeg() {
-    static const bool present = (std::system("ffmpeg -version >/dev/null 2>&1") == 0);
+    static const bool present = run_process({"ffmpeg", "-version"}, true) == 0;
     return present;
 }
 
@@ -614,18 +615,17 @@ inline bool mux_av(const std::string& video_path, const std::string& audio_path,
         if (err) *err = "ffmpeg not found";
         return false;
     }
-    auto quote = [](const std::string& s) {
-        std::string q = "'";
-        for (char c : s) { if (c == '\'') q += "'\\''"; else q += c; }
-        return q + "'";
-    };
-    std::string cmd = "ffmpeg -y -loglevel error -i " + quote(video_path) +
-                      " -i " + quote(audio_path) +
-                      " -c copy -map 0:v:0 -map 1:a:0 " + quote(out_path) +
-                      " >/dev/null 2>&1";
-    int rc = std::system(cmd.c_str());
-    if (rc != 0 && err) *err = "ffmpeg exited " + std::to_string(rc);
-    return rc == 0;
+    try {
+        OutputStage stage(out_path, ".mkv");
+        const int rc = run_process({"ffmpeg", "-n", "-loglevel", "error", "-i", video_path,
+                                    "-i", audio_path, "-c", "copy", "-map", "0:v:0",
+                                    "-map", "1:a:0", stage.output}, true);
+        if (rc != 0 || !stage.finalize()) {
+            if (err) *err = "ffmpeg failed or output already exists";
+            return false;
+        }
+        return true;
+    } catch (const std::exception& error) { if (err) *err = error.what(); return false; }
 }
 
 } // namespace ytfast

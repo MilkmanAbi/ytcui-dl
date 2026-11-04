@@ -129,5 +129,32 @@ with tempfile.TemporaryDirectory(prefix='ytcui transfer space ') as temporary:
                           env=trusted,capture_output=True,timeout=35)
     assert result.returncode!=0 and not (root/'downgrade.bin').exists(),'HTTPS downgrade accepted'
     tls.shutdown(); tls.server_close()
+    # Fake ffmpeg checks the real process boundary without requiring media tools.
+    tools = root/'tools'; tools.mkdir()
+    ffmpeg = tools/'ffmpeg'
+    ffmpeg.write_text('#!'+sys.executable+'\nimport pathlib,sys\nif "-version" not in sys.argv:\n pathlib.Path(sys.argv[-1]).write_bytes(b"encoded-fixture")\n')
+    ffmpeg.chmod(0o755)
+    process_env = dict(os.environ, PATH=str(tools)+os.pathsep+os.environ.get('PATH',''))
+    source=root/"audio';touch injected;'.m4a"; source.write_bytes(b'source')
+    target=root/"converted';touch injected;'.mp3"
+    def native(args,ok=True):
+        result=subprocess.run([str(exe),*map(str,args)],cwd=root,env=process_env,capture_output=True,timeout=20)
+        assert (result.returncode==0)==ok,result.stderr
+    native([source,target,'convert'])
+    assert target.read_bytes()==b'encoded-fixture' and not (root/'injected').exists()
+    target.write_bytes(b'preserve-existing')
+    native([source,target,'convert'],False)
+    assert target.read_bytes()==b'preserve-existing'
+    muxed=root/'mux.mkv'
+    native([source,source,'mux',muxed])
+    assert muxed.read_bytes()==b'encoded-fixture'
+    muxed.write_bytes(b'preserve-muxed')
+    native([source,source,'mux',muxed],False)
+    assert muxed.read_bytes()==b'preserve-muxed'
+    streamed=root/'stream.mp3'
+    legacy=Path(str(streamed)+'.src-audio.tmp'); legacy.write_bytes(b'preserve-foreign-temp')
+    native([f'http://127.0.0.1:{servers[0].server_port}/range',streamed,'stream'])
+    assert streamed.read_bytes()==b'encoded-fixture' and legacy.read_bytes()==b'preserve-foreign-temp'
+    assert not list(root.glob('*.work.*')),'owned staging directories should be cleaned'
 for server in servers: server.shutdown(); server.server_close()
 print('Ranges, chunks, truncation, resume, cancellation, existing files, redirects, metadata limits and TLS checks passed')

@@ -1,4 +1,4 @@
-# ytcui-dl 0.6.0 code audit
+# ytcui-dl 0.6.1 code audit
 
 Scope: integrated browser-session commands, cookie storage/decryption, JSON and
 SQLite parsing, HTTP transport, parallel downloads/resume, and resolution selection.
@@ -28,6 +28,10 @@ the browser helper into `ytcui-dl session`; only `ytcui-dl` is built and install
   credentials across origins and reject HTTPS downgrade redirects. TLS handshakes
   now have socket timeouts. Metadata/decompression sizes are bounded, and TLS
   verification distinguishes IP addresses from DNS hostnames.
+
+- ffmpeg muxing/transcoding now uses argv execution and private staging directories.
+  Existing final outputs are preserved, and cleanup only removes files owned by the
+  current invocation. Compatibility audio conversion never interprets filenames as shell code.
 
 ## Limits retained
 

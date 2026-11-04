@@ -909,11 +909,11 @@ static int ytdlp_main(int argc, char** argv) {
             const std::string dst = (dot == std::string::npos ? out_path : out_path.substr(0, dot))
                                   + "." + o.audio_format;
             if (src != dst) {
-                std::string cmd = "ffmpeg -y -loglevel error -i '" + src + "' '" + dst +
-                                  "' >/dev/null 2>&1";
-                if (std::system(cmd.c_str()) == 0) ::remove(src.c_str());
-                else std::fprintf(stderr, "WARNING: could not convert to %s\n",
-                                  o.audio_format.c_str());
+                if (convert_audio(src, dst)) ::remove(src.c_str());
+                else {
+                    std::fprintf(stderr, "WARNING: could not convert to %s\n", o.audio_format.c_str());
+                    ++failures;
+                }
             }
         }
     }
