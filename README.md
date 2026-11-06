@@ -1,5 +1,7 @@
 # ytcui-dl 0.6.1
 
+> ytcui-dl working again!!
+
 [![CI](https://github.com/MilkmanAbi/ytcui-dl/actions/workflows/ci.yml/badge.svg)](https://github.com/MilkmanAbi/ytcui-dl/actions/workflows/ci.yml)
 
 One C++17 executable for custom YouTube extraction, independent audio/video format
